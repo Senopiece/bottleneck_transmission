@@ -1,5 +1,10 @@
 import numpy as np
-from linal import unrank_fullrank_matrix, rank_fullrank_matrix, count_fullrank_matrices
+from linal import (
+    unrank_fullrank_matrix,
+    rank_fullrank_matrix,
+    count_fullrank_matrices,
+    add_to_basis_rref,
+)
 
 
 # ============================================================
@@ -132,19 +137,18 @@ class Recoverer:
 
         # Collect up to N linearly independent transitions
         us, ws = [], []
+        basis = []  # list of int-encoded columns (GF(2) RREF)
         for u_bits, w_bits in self.transitions:
             u = np.array(u_bits, dtype=np.uint8)
-            w = np.array(w_bits, dtype=np.uint8)
-            # Add if increases rank
-            if len(us) == 0:
+            # treat column as int mask for basis mgmt
+            umask = 0
+            for b in u:
+                umask = (umask << 1) | int(b)
+            indep, basis2 = add_to_basis_rref(umask, basis)
+            if indep:
+                basis = basis2
                 us.append(u)
-                ws.append(w)
-            else:
-                rank_before = np.linalg.matrix_rank(np.column_stack(us) % 2)
-                rank_after = np.linalg.matrix_rank(np.column_stack(us + [u]) % 2)
-                if rank_after > rank_before:
-                    us.append(u)
-                    ws.append(w)
+                ws.append(np.array(w_bits, dtype=np.uint8))
             if len(us) == self.n:
                 break
 
