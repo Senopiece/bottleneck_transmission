@@ -25,17 +25,20 @@ class Producer:
         self.orbits: list[list[np.ndarray]] = []
         self._find_orbits()
 
-        # --- Traversal state ---
+        # --- Initialize traversal state ---
+        self.orbit_order = list(range(len(self.orbits)))
         self.current_orbit_idx = 0
         self.current_orbit_pos = 0
-        self.current_offset = 0  # random offset per orbit
+        self.current_offset = random.randrange(len(self.orbits[self.orbit_order[0]]))
         self.after_separator = False
+        self.cycle_count = 0
 
         if self.verbose:
             print(f"[Producer] A=\n{self.A}")
             print(f"[Producer] Found {len(self.orbits)} orbits total.")
             for i, orb in enumerate(self.orbits):
                 print(f"  Orbit {i}: length={len(orb)}")
+            print(f"[Producer] Starting order: {self.orbit_order}")
 
     # ------------------------------------------------------------
     def _find_orbits(self):
@@ -66,37 +69,51 @@ class Producer:
             self.orbits.append(orbit)
 
     # ------------------------------------------------------------
+    def _shuffle_orbits(self):
+        """Reshuffle orbit order for the next global cycle."""
+        random.shuffle(self.orbit_order)
+        self.cycle_count += 1
+        if self.verbose:
+            print(
+                f"[Producer] 🔀 Shuffled orbit order for cycle #{self.cycle_count}: {self.orbit_order}"
+            )
+
+    # ------------------------------------------------------------
     def generate(self) -> np.ndarray:
-        """Continuously output all orbits in deterministic order, with random offset."""
+        """Continuously output all orbits, shuffled each full pass."""
         if self.after_separator:
-            # Move to next orbit
-            self.current_orbit_idx = (self.current_orbit_idx + 1) % len(self.orbits)
-            orbit_len = len(self.orbits[self.current_orbit_idx])
-            # Pick random offset for new orbit
+            # Move to next orbit in current order
+            self.current_orbit_idx += 1
+            if self.current_orbit_idx >= len(self.orbit_order):
+                # End of pass — reshuffle orbit order
+                self._shuffle_orbits()
+                self.current_orbit_idx = 0
+
+            # Random offset for the new orbit
+            orbit_id = self.orbit_order[self.current_orbit_idx]
+            orbit_len = len(self.orbits[orbit_id])
             self.current_offset = random.randrange(orbit_len)
             self.current_orbit_pos = 0
             self.after_separator = False
             if self.verbose:
                 print(
-                    f"[Producer] → switched to orbit {self.current_orbit_idx} "
-                    f"(offset={self.current_offset})"
+                    f"[Producer] → switched to orbit {orbit_id} (offset={self.current_offset})"
                 )
 
-        orbit = self.orbits[self.current_orbit_idx]
+        orbit_id = self.orbit_order[self.current_orbit_idx]
+        orbit = self.orbits[orbit_id]
         orbit_len = len(orbit)
 
-        # Output within current orbit (with offset)
+        # Output within current orbit
         if self.current_orbit_pos < orbit_len:
             idx = (self.current_offset + self.current_orbit_pos) % orbit_len
             vec = orbit[idx]
             self.current_orbit_pos += 1
             if self.verbose:
-                print(
-                    f"[Producer] out={''.join(map(str, vec))} (orbit {self.current_orbit_idx})"
-                )
+                print(f"[Producer] out={''.join(map(str, vec))} (orbit {orbit_id})")
             return vec.copy()
 
-        # Orbit finished → emit separator
+        # After orbit end → emit zero separator
         else:
             self.after_separator = True
             if self.verbose:
