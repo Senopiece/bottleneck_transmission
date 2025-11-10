@@ -8,9 +8,6 @@ from linal import (
 import random
 
 
-import numpy as np
-
-
 class Producer:
     def __init__(self, n: int, index: int, verbose: bool = False):
         self.n = n
@@ -28,9 +25,10 @@ class Producer:
         self.orbits: list[list[np.ndarray]] = []
         self._find_orbits()
 
-        # --- Initialize traversal state ---
+        # --- Traversal state ---
         self.current_orbit_idx = 0
         self.current_orbit_pos = 0
+        self.current_offset = 0  # random offset per orbit
         self.after_separator = False
 
         if self.verbose:
@@ -41,7 +39,7 @@ class Producer:
 
     # ------------------------------------------------------------
     def _find_orbits(self):
-        """Compute all distinct non-zero orbits."""
+        """Compute all distinct orbits under x → A x (mod 2)."""
         all_states = [
             np.array(
                 [(i >> (self.n - 1 - b)) & 1 for b in range(self.n)], dtype=np.uint8
@@ -49,7 +47,6 @@ class Producer:
             for i in range(1, 2**self.n)
         ]
         seen = set()
-
         for s in all_states:
             if tuple(s) in seen:
                 continue
@@ -65,24 +62,33 @@ class Producer:
                 if tuple(x_next) in seen:
                     break
                 x = x_next
+
             self.orbits.append(orbit)
 
     # ------------------------------------------------------------
     def generate(self) -> np.ndarray:
-        """Continuously output all orbits in fixed order with separators."""
+        """Continuously output all orbits in deterministic order, with random offset."""
         if self.after_separator:
-            # Move to next orbit in deterministic order
+            # Move to next orbit
             self.current_orbit_idx = (self.current_orbit_idx + 1) % len(self.orbits)
+            orbit_len = len(self.orbits[self.current_orbit_idx])
+            # Pick random offset for new orbit
+            self.current_offset = random.randrange(orbit_len)
             self.current_orbit_pos = 0
             self.after_separator = False
             if self.verbose:
-                print(f"[Producer] → switched to orbit {self.current_orbit_idx}")
+                print(
+                    f"[Producer] → switched to orbit {self.current_orbit_idx} "
+                    f"(offset={self.current_offset})"
+                )
 
         orbit = self.orbits[self.current_orbit_idx]
+        orbit_len = len(orbit)
 
-        # Output within current orbit
-        if self.current_orbit_pos < len(orbit):
-            vec = orbit[self.current_orbit_pos]
+        # Output within current orbit (with offset)
+        if self.current_orbit_pos < orbit_len:
+            idx = (self.current_offset + self.current_orbit_pos) % orbit_len
+            vec = orbit[idx]
             self.current_orbit_pos += 1
             if self.verbose:
                 print(
@@ -90,7 +96,7 @@ class Producer:
                 )
             return vec.copy()
 
-        # After orbit end, emit separator before continuing
+        # Orbit finished → emit separator
         else:
             self.after_separator = True
             if self.verbose:
