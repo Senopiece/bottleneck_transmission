@@ -5,74 +5,124 @@ from linal import (
     count_fullrank_matrices,
     add_to_basis_rref,
 )
-
+import random
 
 # ============================================================
-#  Producer with cycle detection and verbose logging
+#  Producer that enumerates all orbits of A mod 2 in random order
 # ============================================================
 
 
 class Producer:
-    def __init__(
-        self, n: int, index: int, seed: np.ndarray | None = None, verbose: bool = False
-    ):
+    def __init__(self, n: int, index: int, verbose: bool = False):
         self.n = n
         self.index = index
         self.verbose = verbose
 
+        # --- Build generator matrix A from full-rank index ---
         self.cols = unrank_fullrank_matrix(n, index)
         self.A = np.array(
             [[(col >> (n - 1 - r)) & 1 for col in self.cols] for r in range(n)],
             dtype=np.uint8,
         )
 
-        if seed is None:
-            self.state = np.random.randint(0, 2, n, dtype=np.uint8)
-        else:
-            self.state = seed.copy()
+        # --- Precompute all orbits (excluding zero vector) ---
+        self.orbits: list[list[np.ndarray]] = []
+        self._find_orbits()
 
-        self.visited = {tuple(self.state)}
-        self.reset_pending = False
-        self.resets_done = 0
+        # --- Initialize state machine ---
+        self.current_orbit_idx = 0
+        self.current_orbit_pos = 0
+        self.prev_orbit_idx = None
+        self.sequence_exhausted = False
 
         if self.verbose:
             print(f"[Producer] A=\n{self.A}")
-            print(f"[Producer] init state={''.join(map(str, self.state))}")
+            print(f"[Producer] Total orbits found: {len(self.orbits)}")
+            for i, orbit in enumerate(self.orbits):
+                print(f"  Orbit {i}: length={len(orbit)}")
 
-    def generate(self) -> np.ndarray:
-        """Generate next vector, injecting a zero packet on cycle loopback."""
-        if self.reset_pending:
-            self.reset_pending = False
+    # ------------------------------------------------------------
+    def _find_orbits(self):
+        """Compute all distinct orbits under x → A x (mod 2)."""
+        all_states = [
+            np.array(
+                [(i >> (self.n - 1 - b)) & 1 for b in range(self.n)], dtype=np.uint8
+            )
+            for i in range(1, 2**self.n)
+        ]  # exclude zero
+        seen = set()
+
+        for s in all_states:
+            key = tuple(s)
+            if key in seen:
+                continue
+
+            orbit = []
+            x = s.copy()
+            while True:
+                orbit.append(x.copy())
+                seen.add(tuple(x))
+                x_next = (self.A @ x) % 2
+                if np.array_equal(x_next, orbit[0]):  # closed orbit
+                    break
+                if tuple(x_next) in seen:  # safety guard
+                    break
+                x = x_next
+
+            self.orbits.append(orbit)
+
+    # ------------------------------------------------------------
+    def _choose_next_orbit(self):
+        """Randomly choose the next orbit, avoiding the previous one if possible."""
+        num_orbits = len(self.orbits)
+        if num_orbits == 1:
+            return 0  # only one orbit exists
+        candidates = [i for i in range(num_orbits) if i != self.prev_orbit_idx]
+        return random.choice(candidates)
+
+    # ------------------------------------------------------------
+    def generate(self) -> np.ndarray | None:
+        """Emit vectors orbit-by-orbit with 0 separators, switching randomly between orbits."""
+        if self.sequence_exhausted:
             if self.verbose:
-                print(f"[Producer] → cycle reset marker (00000)")
-            return np.zeros(self.n, dtype=np.uint8)
+                print("[Producer] End of transmission.")
+            return None
 
-        next_state = (self.A @ self.state) % 2
-        key = tuple(next_state)
-
-        if key in self.visited:
-            # cycle detected
-            self.visited.clear()
-            self.reset_pending = True
-            self.resets_done += 1
+        # Case 1: emitting current orbit
+        if self.current_orbit_pos < len(self.orbits[self.current_orbit_idx]):
+            state = self.orbits[self.current_orbit_idx][self.current_orbit_pos]
+            self.current_orbit_pos += 1
             if self.verbose:
                 print(
-                    f"[Producer] Cycle detected after {len(self.visited)} states → inject 0, restart."
+                    f"[Producer] out={''.join(map(str, state))} (orbit {self.current_orbit_idx})"
                 )
-            # choose a new random nonzero seed
-            while True:
-                self.state = np.random.randint(0, 2, self.n, dtype=np.uint8)
-                if np.any(self.state):
-                    break
-            self.visited.add(tuple(self.state))
+            return state.copy()
+
+        # Case 2: finished current orbit → emit zero separator
+        elif self.current_orbit_pos == len(self.orbits[self.current_orbit_idx]):
+            self.current_orbit_pos += 1
+            if self.verbose:
+                print(f"[Producer] → orbit separator (00000)")
             return np.zeros(self.n, dtype=np.uint8)
 
-        self.visited.add(key)
-        self.state = next_state
+        # Case 3: after separator, switch to next random orbit
+        else:
+            remaining = len(self.orbits)
+            if remaining == 0:
+                self.sequence_exhausted = True
+                return None
 
-        if self.verbose:
-            print(f"[Producer] out={''.join(map(str, self.state))}")
-        return self.state.copy()
+            self.prev_orbit_idx = self.current_orbit_idx
+            self.current_orbit_idx = self._choose_next_orbit()
+            self.current_orbit_pos = 0
+
+            if self.verbose:
+                print(
+                    f"[Producer] Switching orbit: {self.prev_orbit_idx} → {self.current_orbit_idx}"
+                )
+
+            # Recursively generate the first vector of the new orbit
+            return self.generate()
 
 
 # ============================================================
