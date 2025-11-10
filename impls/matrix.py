@@ -80,57 +80,102 @@ class Recoverer:
         self.n = n
         self.verbose = verbose
         self.prev = None
-        self.transitions: list[tuple[np.ndarray, np.ndarray]] = []
+        # Store all unique transitions as tuples of tuples
+        self.transitions: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
         self.recovered_index = None
 
     def feed(self, data: np.ndarray | None) -> int | None:
+        """Feed a new packet or None (gap). Returns recovered index or None."""
         if data is None:
             if self.verbose:
                 print("[Recoverer] GAP → reset prev")
             self.prev = None
             return self.recovered_index
 
+        data = np.array(data, dtype=np.uint8) % 2
+
+        # Handle explicit reset marker (zero packet)
         if np.all(data == 0):
             if self.verbose:
                 print("[Recoverer] Zero packet → segment break")
             self.prev = None
             return self.recovered_index
 
+        # Record a transition (prev → data)
         if self.prev is not None and not np.all(self.prev == 0):
-            self.transitions.append((self.prev.copy(), data.copy()))
+            key = (tuple(self.prev.tolist()), tuple(data.tolist()))
+            if key not in self.transitions:
+                self.transitions.add(key)
+                if self.verbose:
+                    print(
+                        f"[Recoverer] + Added transition #{len(self.transitions)}: "
+                        f"{''.join(map(str, self.prev))} → {''.join(map(str, data))}"
+                    )
+            elif self.verbose:
+                print(
+                    f"[Recoverer]   (duplicate transition ignored, total={len(self.transitions)})"
+                )
 
         self.prev = data.copy()
 
-        # --- Try to solve adaptively ---
-        if len(self.transitions) >= self.n:
-            # keep only the latest N transitions for solvability
-            recent = self.transitions[-self.n :]
-            X = np.stack([t[0] for t in recent], axis=1) % 2
-            Y = np.stack([t[1] for t in recent], axis=1) % 2
-            rank = np.linalg.matrix_rank(X)
+        # Skip solving if already recovered
+        if self.recovered_index is not None:
+            return self.recovered_index
 
+        # Try recovery once we have enough distinct transitions
+        if len(self.transitions) < self.n:
             if self.verbose:
                 print(
-                    f"[Recoverer] Rank={rank}/{self.n}, buffer={len(self.transitions)}"
+                    f"[Recoverer] Transitions collected: {len(self.transitions)}/{self.n}"
                 )
+            return None
 
-            if rank == self.n:
-                try:
-                    A = self._solve_mod2(Y, X)
-                except np.linalg.LinAlgError:
-                    return None
+        # Collect up to N linearly independent transitions
+        us, ws = [], []
+        for u_bits, w_bits in self.transitions:
+            u = np.array(u_bits, dtype=np.uint8)
+            w = np.array(w_bits, dtype=np.uint8)
+            # Add if increases rank
+            if len(us) == 0:
+                us.append(u)
+                ws.append(w)
+            else:
+                rank_before = np.linalg.matrix_rank(np.column_stack(us) % 2)
+                rank_after = np.linalg.matrix_rank(np.column_stack(us + [u]) % 2)
+                if rank_after > rank_before:
+                    us.append(u)
+                    ws.append(w)
+            if len(us) == self.n:
+                break
 
-                cols = [int("".join(str(b) for b in A[:, j]), 2) for j in range(self.n)]
-                idx = rank_fullrank_matrix(self.n, cols)
-                self.recovered_index = idx
-                if self.verbose:
-                    print(f"[Recoverer] ✅ Recovered index={idx}")
-                return idx
+        if len(us) < self.n:
+            if self.verbose:
+                print(
+                    f"[Recoverer] Rank {len(us)}/{self.n} → waiting for more independent transitions."
+                )
+            return None
 
-        return None
+        # Solve for A
+        U = np.column_stack(us) % 2
+        W = np.column_stack(ws) % 2
+
+        try:
+            A = self._solve_mod2(W, U)
+        except np.linalg.LinAlgError:
+            if self.verbose:
+                print("[Recoverer] ❌ Singular transition matrix, retrying later")
+            return None
+
+        cols = [int("".join(str(b) for b in A[:, j]), 2) for j in range(self.n)]
+        idx = rank_fullrank_matrix(self.n, cols)
+        self.recovered_index = idx
+        if self.verbose:
+            print(f"[Recoverer] ✅ Recovered index={idx}")
+        return idx
 
     @staticmethod
     def _solve_mod2(Y: np.ndarray, X: np.ndarray) -> np.ndarray:
+        """Solve Y = A X for A over GF(2)."""
         n = X.shape[0]
         aug = np.concatenate([X.copy(), np.eye(n, dtype=np.uint8)], axis=1)
         for i in range(n):
