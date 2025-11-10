@@ -105,7 +105,7 @@ class Producer:
         orbit_len = len(orbit)
 
         # Output within current orbit
-        if self.current_orbit_pos < orbit_len:
+        if self.current_orbit_pos <= orbit_len:
             idx = (self.current_offset + self.current_orbit_pos) % orbit_len
             vec = orbit[idx]
             self.current_orbit_pos += 1
