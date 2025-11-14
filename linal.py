@@ -110,6 +110,7 @@ def in_span(v, basis):
 # ---------- rank / unrank utilities ----------
 
 
+# TODO: find other implementations
 def unrank_fullrank_matrix(n, index):
     """Construct the ``index``-th full-rank binary NxN matrix (by columns).
 
@@ -143,6 +144,7 @@ def unrank_fullrank_matrix(n, index):
     return cols
 
 
+# TODO: find other implementations
 def rank_fullrank_matrix(n, cols):
     """Compute the unique index of a full-rank binary NxN matrix.
 
