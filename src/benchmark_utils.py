@@ -86,7 +86,7 @@ def benchmark(
     return {k: v / passes for k, v in time_to_recover_distribution.items()}
 
 
-def compute_distribution_stats(D: int, distribution: dict):
+def compute_distribution_stats(N: int, D: int, distribution: dict):
     """
     Take raw distribution (dict: time -> probability)
     and return minimal useful stats:
@@ -96,14 +96,7 @@ def compute_distribution_stats(D: int, distribution: dict):
     """
 
     if not distribution:
-        return {
-            "expected_time": None,
-            "plot_df": None,
-            "sigma": None,
-            "t_min": None,
-            "t_max": None,
-            "D": D,
-        }
+        raise ValueError("Empty distribution provided")
 
     # Sorted distribution table
     df = pd.DataFrame(list(distribution.items()), columns=["time_to_recover", "prob"])
@@ -156,13 +149,18 @@ def compute_distribution_stats(D: int, distribution: dict):
     else:
         df_plot = df_full[["time_to_recover", "prob", "smoothed"]].copy()
 
+    payload_bits = math.log2(D)
+    transmitted_bits = expected_time * N
     return {
         "expected_time": expected_time,
         "plot_df": df_plot,
         "sigma": sigma,
         "t_min": t_min,
         "t_max": t_max,
-        "D": D,
+        "packet_efficiency": payload_bits
+        / expected_time,  # how many payload bits per transmitted packet
+        "bit_efficency": payload_bits
+        / transmitted_bits,  # how many payload bits per transmitted bit
     }
 
 
@@ -244,6 +242,7 @@ def visual_benchmark(
     iters_bound: int = 300,
 ):
     return compute_distribution_stats(
+        N,
         D,
         benchmark(
             producer_constructor,
