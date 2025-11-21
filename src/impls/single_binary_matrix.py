@@ -86,7 +86,7 @@ def matrix_to_index(A: np.ndarray) -> int:
 # ---------- Producer ----------
 
 
-class FullrankProducer(Producer):
+class MatrixProducer(Producer):
     """
     Producer for arbitrary binary n×n matrices (no full-rank restriction),
     but smart: when starting a new orbit, pick *tails* first.
@@ -226,7 +226,7 @@ class FullrankProducer(Producer):
 # ---------- Recoverer ----------
 
 
-class FullrankRecoverer(Recoverer):
+class MatrixRecoverer(Recoverer):
     """
     Recoverer for arbitrary binary n×n matrices A.
 
@@ -377,9 +377,9 @@ override_D = lambda n: 2 ** (n * n)
 def producer_constructor(index: int, n: int, d: int) -> Producer:
     # All n×n binary matrices are allowed: total payload size 2^(n^2)
     assert d == 2 ** (n * n)
-    return FullrankProducer(n, index)
+    return MatrixProducer(n, index)
 
 
 def recoverer_constructor(n: int, d: int) -> Recoverer:
     assert d == 2 ** (n * n)
-    return FullrankRecoverer(n)
+    return MatrixRecoverer(n)
