@@ -440,6 +440,9 @@ class FullrankRecoverer(Recoverer):
         return (Y @ X_inv) % 2
 
 
+override_D = lambda n: count_fullrank_matrices(n)
+
+
 def producer_constructor(index: int, n: int, d: int) -> Producer:
     assert d == count_fullrank_matrices(n)
     return FullrankProducer(n, index)
