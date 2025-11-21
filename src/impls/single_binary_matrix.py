@@ -88,25 +88,11 @@ def matrix_to_index(A: np.ndarray) -> int:
 
 class FullrankProducer(Producer):
     """
-    Producer for arbitrary binary n×n matrices (no full-rank restriction).
+    Producer for arbitrary binary n×n matrices (no full-rank restriction),
+    but smart: when starting a new orbit, pick *tails* first.
 
-    Payload index ∈ [0, 2^(n^2)) is mapped to A by index_to_matrix.
-    The producer simulates a generator:
-
-        visited = {0}
-        curr = 0
-        while True:
-            if curr in visited:
-                yield 0                      # separator
-                if all vectors visited:
-                    visited = {0}            # reset, keep 0 as visited
-                curr = random unvisited
-            yield curr
-            visited.add(curr)
-            curr = A @ curr (mod 2)
-
-    (We always emit a zero separator before starting a new orbit; this
-    makes recovery unambiguous and only adds extra zeros in the stream.)
+    Tail = a state with no incoming edges from the remaining unvisited states.
+    If only cycles remain, pick any vector from those cycles.
     """
 
     def __init__(self, n: int, index: int, verbose: bool = False):
@@ -114,26 +100,27 @@ class FullrankProducer(Producer):
         self.index = index
         self.verbose = verbose
 
-        # Build generator matrix A directly from payload bits
+        # Build generator matrix from payload bits
         self.A = index_to_matrix(n, index)
 
-        # State of the Markov chain x -> A x (mod 2) over {0,1}^n
-        self.curr: int = 0  # integer-encoded current state
+        # Precompute successor and predecessor graph
+        self._build_graph()
+
+        # State
+        self.curr: int = 0
         self.visited: set[int] = {0}
         self.all_states: set[int] = set(range(2**n))
         self.unvisited: set[int] = self.all_states - self.visited
 
-        # Whether we just emitted a separator zero
-        self.after_separator: bool = False
-        self.cycle_count: int = 0
+        self.after_separator = False
+        self.cycle_count = 0
 
         if self.verbose:
-            print(f"[Producer] n={n}, index={index}")
             print(f"[Producer] A=\n{self.A}")
+            print(f"[Producer] graph built with {2**n} nodes")
 
     # ------------------------------------------------------------
     def _int_to_vec(self, x: int) -> np.ndarray:
-        """Convert integer to n-bit column vector (MSB first)."""
         return np.array(
             [(x >> (self.n - 1 - b)) & 1 for b in range(self.n)], dtype=np.uint8
         )
@@ -142,63 +129,97 @@ class FullrankProducer(Producer):
         return vector_to_int(v)
 
     # ------------------------------------------------------------
+    def _build_graph(self):
+        """Build successor and predecessor lists for x -> A x."""
+        self.succ = {}
+        self.pred = {i: [] for i in range(2**self.n)}
+
+        for x in range(2**self.n):
+            v = self._int_to_vec(x)
+            nxt = (self.A @ v) % 2
+            y = self._vec_to_int(nxt)
+
+            self.succ[x] = y
+            self.pred[y].append(x)
+
+    # ------------------------------------------------------------
+    def _find_tails(self) -> list[int]:
+        """
+        Return list of unvisited nodes that have NO incoming edges from other unvisited nodes.
+        """
+        tails = []
+        for x in self.unvisited:
+            incoming = self.pred[x]
+            # Check if any predecessor is also unvisited
+            if not any(p in self.unvisited for p in incoming):
+                tails.append(x)
+        return tails
+
+    # ------------------------------------------------------------
+    def _choose_new_start(self) -> int:
+        """
+        Choose next start state:
+        1. If unvisited contains tails -> sample from tails.
+        2. Else -> sample any unvisited state (only cycles left).
+        """
+        tails = self._find_tails()
+        if tails:
+            return random.choice(tails)
+        return random.choice(tuple(self.unvisited))
+
+    # ------------------------------------------------------------
     def generate(self) -> np.ndarray:
-        """Emit an infinite stream of n-bit packets (np.uint8), with zeros as separators."""
-        # If current state already visited -> we need to start a new orbit
+        """Emit infinite stream of n-bit packets with zero separators."""
+        # Must restart orbit
         if self.curr in self.visited:
-            # First emit an explicit zero separator (if we didn't just emit one)
             if not self.after_separator:
                 self.after_separator = True
                 if self.verbose:
-                    print(
-                        f"[Producer] -> separator (0...0), curr={self.curr}, visited={len(self.visited)}"
-                    )
+                    print("[Producer] -> separator")
                 return np.zeros(self.n, dtype=np.uint8)
 
-            # Now pick a new start state from unvisited set
+            # Exhaustion detection
             if not self.unvisited:
-                # All states exhausted, reset visitation (keep 0 as reserved)
                 self.cycle_count += 1
                 self.visited = {0}
                 self.unvisited = self.all_states - self.visited
                 if self.verbose:
-                    print(
-                        f"[Producer] RESET visited for cycle #{self.cycle_count} "
-                        f"(all {2**self.n} states used)"
-                    )
+                    print(f"[Producer] RESET visited (cycle #{self.cycle_count})")
 
-            # Sample a fresh start from unvisited
-            self.curr = random.choice(tuple(self.unvisited))
-            self.visited.add(self.curr)
-            self.unvisited.remove(self.curr)
+            # Choose new start (TAILS first)
+            start = self._choose_new_start()
+            self.curr = start
 
-            vec = self._int_to_vec(self.curr)
-            next_vec = (self.A @ vec) % 2
-            self.curr = self._vec_to_int(next_vec)
+            self.visited.add(start)
+            if start in self.unvisited:
+                self.unvisited.remove(start)
+
+            vec = self._int_to_vec(start)
+            nxt = (self.A @ vec) % 2
+            self.curr = self._vec_to_int(nxt)
             self.after_separator = False
 
             if self.verbose:
                 print(
-                    f"[Producer] start orbit at {''.join(map(str, vec))}, "
-                    f"next={self.curr}, visited={len(self.visited)}"
+                    f"[Producer] start orbit @ {start:0{self.n}b} "
+                    f"(tails={len(self._find_tails())})"
                 )
+
             return vec.copy()
 
-        # Normal step inside an orbit: x_{k+1} = A x_k
+        # Normal orbit continuation
         self.visited.add(self.curr)
         if self.curr in self.unvisited:
             self.unvisited.remove(self.curr)
 
         vec = self._int_to_vec(self.curr)
-        next_vec = (self.A @ vec) % 2
-        self.curr = self._vec_to_int(next_vec)
+        nxt = (self.A @ vec) % 2
+        self.curr = self._vec_to_int(nxt)
         self.after_separator = False
 
         if self.verbose:
-            print(
-                f"[Producer] cont orbit: out={''.join(map(str, vec))}, "
-                f"next={self.curr}, visited={len(self.visited)}"
-            )
+            print(f"[Producer] cont orbit: {vec}")
+
         return vec.copy()
 
 
