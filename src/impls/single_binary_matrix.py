@@ -304,6 +304,7 @@ class MatrixRecoverer(Recoverer):
         ws: list[np.ndarray] = []
         basis: list[int] = []  # RREF basis of chosen u's (as int bitmasks)
 
+        # TODO: with this greedy approach, we might miss some valid basis, generally we need to consider all the n choose len(transitions) subsets
         for u_bits, w_bits in self.transitions:
             u = np.array(u_bits, dtype=np.uint8)
             umask = vector_to_int(u)
