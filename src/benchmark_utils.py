@@ -2,6 +2,7 @@ import math
 import multiprocessing as mp
 import queue
 import random
+import traceback
 from collections import defaultdict
 from typing import Callable
 
@@ -135,22 +136,29 @@ def _worker_entry(
     progress_queue: mp.Queue,
     progress_step: int,
     result_queue: mp.Queue,
+    error_queue: mp.Queue,
 ):
     def report(delta: int):
         progress_queue.put(delta)
 
-    result = _run_benchmark_chunk(
-        producer_constructor,
-        recoverer_constructor,
-        N,
-        D,
-        passes,
-        sample_burst_size,
-        sample_data_size,
-        iters_bound,
-        report,
-        progress_step,
-    )
+    try:
+        result = _run_benchmark_chunk(
+            producer_constructor,
+            recoverer_constructor,
+            N,
+            D,
+            passes,
+            sample_burst_size,
+            sample_data_size,
+            iters_bound,
+            report,
+            progress_step,
+        )
+    except Exception:
+        # Surface worker failures to the master so it can halt everything immediately.
+        error_queue.put(traceback.format_exc())
+        return
+
     progress_queue.put(None)
     result_queue.put(result)
 
@@ -249,6 +257,7 @@ def benchmark(
     ctx = mp.get_context("spawn")
     progress_queue: mp.Queue = ctx.Queue()
     result_queue: mp.Queue = ctx.Queue()
+    error_queue: mp.Queue = ctx.Queue()
 
     base, remainder = divmod(total_passes, processes)
     passes_per_worker = [base + (1 if i < remainder else 0) for i in range(processes)]
@@ -270,14 +279,25 @@ def benchmark(
                 progress_queue,
                 progress_update,
                 result_queue,
+                error_queue,
             ),
         )
         p.start()
         procs.append(p)
 
     finished = 0
+    worker_error = None
     with tqdm(total=total_passes, desc="benchmark") as pbar:
         while finished < len(passes_per_worker):
+            if worker_error is None:
+                try:
+                    worker_error = error_queue.get_nowait()
+                except queue.Empty:
+                    worker_error = None
+
+            if worker_error is not None:
+                break
+
             try:
                 msg = progress_queue.get(timeout=0.1)
             except queue.Empty:
@@ -286,6 +306,23 @@ def benchmark(
                 finished += 1
             else:
                 pbar.update(int(msg))
+
+    # Check for errors after the loop in case they arrived during shutdown.
+    if worker_error is None:
+        try:
+            worker_error = error_queue.get_nowait()
+        except queue.Empty:
+            worker_error = None
+
+    if worker_error is not None:
+        print("Benchmark worker failed with an exception:")
+        print(worker_error)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join()
+        raise RuntimeError("Benchmark worker failed; see worker traceback above.")
 
     worker_results = [result_queue.get() for _ in passes_per_worker]
     for p in procs:
