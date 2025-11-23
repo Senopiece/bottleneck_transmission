@@ -1,32 +1,62 @@
+import math
+import multiprocessing as mp
+import queue
 import random
 from collections import defaultdict
 from typing import Callable
+
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import math
-import numpy as np
 from tqdm import tqdm
 
 from impls._interface import Producer, Recoverer
 
 
-def benchmark(
+def _default_sample_burst_size() -> int:
+    return random.randint(1, 5)
+
+
+def _default_sample_data_size() -> int:
+    return random.randint(3, 30)
+
+
+def _visual_default_sample_burst_size() -> int:
+    return random.randint(1, 10)
+
+
+def _visual_default_sample_data_size() -> int:
+    return random.randint(3, 5)
+
+
+def _run_benchmark_chunk(
     producer_constructor: Callable[[int, int, int], Producer],
     recoverer_constructor: Callable[[int, int], Recoverer],
     N: int,
     D: int,
-    passes: int = 100,
-    sample_burst_size: Callable[[], int] = lambda: random.randint(1, 5),
-    sample_data_size: Callable[[], int] = lambda: random.randint(3, 30),
-    iters_bound: int = 10000,
+    passes: int,
+    sample_burst_size: Callable[[], int],
+    sample_data_size: Callable[[], int],
+    iters_bound: int,
+    progress_reporter: Callable[[int], None] | None = None,
+    progress_step: int = 100,
 ):
+    """Run a benchmark slice and optionally report progress via `progress_reporter`."""
     time_to_recover_distribution = defaultdict(lambda: 0)
-
-    init_pat = 3
-    patience = init_pat
+    burst_sum = 0
+    burst_count = 0
+    data_size_sum = 0
+    data_size_count = 0
+    failures = 0
     mismatch = 0
 
-    for _ in tqdm(range(passes)):
+    processed = 0
+    reported = 0
+    step = max(1, progress_step)
+
+    for _ in range(passes):
+        processed += 1
+
         # Make random binary data matrix
         data = random.randint(0, D - 1)
         recovered = None
@@ -39,12 +69,17 @@ def benchmark(
         for _ in range(iters_bound):
             # Skip samples
             burst_size = sample_burst_size()
+            burst_sum += burst_size
+            burst_count += 1
             time_to_recover += burst_size
             for _ in range(burst_size):
                 producer.generate()
 
             # Use samples
-            for _ in range(sample_data_size()):
+            data_size = sample_data_size()
+            data_size_sum += data_size
+            data_size_count += 1
+            for _ in range(data_size):
                 sample = producer.generate()
                 assert (
                     sample.shape == (N,)
@@ -62,38 +97,220 @@ def benchmark(
             recoverer.feed(None)  # Indicate end of continuity
 
         if recovered is None:
-            if patience > 0:
-                print(f"Failed to recover {data} within iteration bound")
-            patience -= 1
-            passes -= 1
-            continue
-
-        # Check correctness
-        # assert np.array_equal(recovered, data), f"Expected {data}, got {recovered}"
-        if not np.array_equal(recovered, data):
-            if patience > 0:
-                print(f"Data mismatch: expected {data}, got {recovered}")
-                patience -= 1
+            failures += 1
+        elif not np.array_equal(recovered, data):
             mismatch += 1
-            passes -= 1
-            continue
+        else:
+            time_to_recover_distribution[time_to_recover] += 1
 
-        time_to_recover_distribution[time_to_recover] += 1
+        if progress_reporter and (processed - reported >= step):
+            delta = processed - reported
+            progress_reporter(delta)
+            reported = processed
 
-    print(f"{init_pat - patience} failures.")
-    if mismatch > 0:
-        print(f"{mismatch} MISMATCHES!!!")
-    return {k: v / passes for k, v in time_to_recover_distribution.items()}
+    if progress_reporter and processed > reported:
+        progress_reporter(processed - reported)
+
+    return {
+        "distribution_counts": dict(time_to_recover_distribution),
+        "burst_sum": burst_sum,
+        "burst_count": burst_count,
+        "data_size_sum": data_size_sum,
+        "data_size_count": data_size_count,
+        "failures": failures,
+        "mismatches": mismatch,
+        "successes": sum(time_to_recover_distribution.values()),
+    }
 
 
-def compute_distribution_stats(N: int, D: int, distribution: dict):
+def _worker_entry(
+    producer_constructor: Callable[[int, int, int], Producer],
+    recoverer_constructor: Callable[[int, int], Recoverer],
+    N: int,
+    D: int,
+    passes: int,
+    sample_burst_size: Callable[[], int],
+    sample_data_size: Callable[[], int],
+    iters_bound: int,
+    progress_queue: mp.Queue,
+    progress_step: int,
+    result_queue: mp.Queue,
+):
+    def report(delta: int):
+        progress_queue.put(delta)
+
+    result = _run_benchmark_chunk(
+        producer_constructor,
+        recoverer_constructor,
+        N,
+        D,
+        passes,
+        sample_burst_size,
+        sample_data_size,
+        iters_bound,
+        report,
+        progress_step,
+    )
+    progress_queue.put(None)
+    result_queue.put(result)
+
+
+def _finalize_results(worker_results: list[dict]):
+    merged_distribution = defaultdict(int)
+    burst_sum = 0
+    burst_count = 0
+    data_size_sum = 0
+    data_size_count = 0
+    failures = 0
+    mismatches = 0
+
+    for res in worker_results:
+        for k, v in res["distribution_counts"].items():
+            merged_distribution[k] += v
+        burst_sum += res["burst_sum"]
+        burst_count += res["burst_count"]
+        data_size_sum += res["data_size_sum"]
+        data_size_count += res["data_size_count"]
+        failures += res["failures"]
+        mismatches += res["mismatches"]
+
+    successes = sum(merged_distribution.values())
+    if failures:
+        print(f"{failures} failures.")
+    if mismatches:
+        print(f"{mismatches} MISMATCHES!!!")
+
+    expected_burst_size = burst_sum / burst_count if burst_count > 0 else float("nan")
+    expected_data_size = (
+        data_size_sum / data_size_count if data_size_count > 0 else float("nan")
+    )
+
+    if successes == 0:
+        distribution = {}
+    else:
+        distribution = {k: v / successes for k, v in merged_distribution.items()}
+
+    return {
+        "distribution": distribution,
+        "expected_sample_burst_size": expected_burst_size,
+        "expected_sample_data_size": expected_data_size,
+    }
+
+
+def benchmark(
+    producer_constructor: Callable[[int, int, int], Producer],
+    recoverer_constructor: Callable[[int, int], Recoverer],
+    N: int,
+    D: int,
+    passes: int = 100,
+    sample_burst_size: Callable[[], int] = _default_sample_burst_size,
+    sample_data_size: Callable[[], int] = _default_sample_data_size,
+    iters_bound: int = 10000,
+    processes: int | None = None,
+    progress_update: int = 100,
+):
+    total_passes = max(0, int(passes))
+    if total_passes == 0:
+        return _finalize_results(
+            [
+                {
+                    "distribution_counts": {},
+                    "burst_sum": 0,
+                    "burst_count": 0,
+                    "data_size_sum": 0,
+                    "data_size_count": 0,
+                    "failures": 0,
+                    "mismatches": 0,
+                    "successes": 0,
+                }
+            ]
+        )
+
+    if processes is None:
+        processes = min(mp.cpu_count() or 1, total_passes)
+    processes = max(1, min(int(processes), total_passes))
+
+    if processes == 1:
+        with tqdm(total=total_passes, desc="benchmark") as pbar:
+            result = _run_benchmark_chunk(
+                producer_constructor,
+                recoverer_constructor,
+                N,
+                D,
+                total_passes,
+                sample_burst_size,
+                sample_data_size,
+                iters_bound,
+                pbar.update,
+                progress_update,
+            )
+        return _finalize_results([result])
+
+    ctx = mp.get_context("spawn")
+    progress_queue: mp.Queue = ctx.Queue()
+    result_queue: mp.Queue = ctx.Queue()
+
+    base, remainder = divmod(total_passes, processes)
+    passes_per_worker = [base + (1 if i < remainder else 0) for i in range(processes)]
+    passes_per_worker = [p for p in passes_per_worker if p > 0]
+
+    procs = []
+    for worker_passes in passes_per_worker:
+        p = ctx.Process(
+            target=_worker_entry,
+            args=(
+                producer_constructor,
+                recoverer_constructor,
+                N,
+                D,
+                worker_passes,
+                sample_burst_size,
+                sample_data_size,
+                iters_bound,
+                progress_queue,
+                progress_update,
+                result_queue,
+            ),
+        )
+        p.start()
+        procs.append(p)
+
+    finished = 0
+    with tqdm(total=total_passes, desc="benchmark") as pbar:
+        while finished < len(passes_per_worker):
+            try:
+                msg = progress_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if msg is None:
+                finished += 1
+            else:
+                pbar.update(int(msg))
+
+    worker_results = [result_queue.get() for _ in passes_per_worker]
+    for p in procs:
+        p.join()
+
+    return _finalize_results(worker_results)
+
+
+def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
     """
-    Take raw distribution (dict: time -> probability)
-    and return minimal useful stats:
+    Take raw distribution (dict: time -> probability) and optional metadata
+    from benchmark() and return minimal useful stats:
         - expected_time
         - plot_df (possibly downsampled and smoothed)
         - sigma, t_min, t_max, D
+        - expected_sample_burst_size, expected_sample_data_size
     """
+
+    # Allow callers to pass either the raw distribution or the dict returned by benchmark()
+    distribution = benchmark_result.get("distribution", {})
+    expected_burst_size = benchmark_result.get("expected_sample_burst_size")
+    expected_data_size = benchmark_result.get("expected_sample_data_size")
+
+    assert expected_burst_size is not None, "expected_sample_burst_size missing"
+    assert expected_data_size is not None, "expected_sample_data_size missing"
 
     if not distribution:
         raise ValueError("Empty distribution provided")
@@ -110,18 +327,6 @@ def compute_distribution_stats(N: int, D: int, distribution: dict):
     df_full = pd.DataFrame({"time_to_recover": full_idx})
     df_full = df_full.merge(df, on="time_to_recover", how="left").fillna(0)
 
-    # Gaussian smoothing
-    range_len = t_max - t_min + 1
-    sigma = max(1.0, range_len / 100.0)
-    radius = int(max(1, int(3 * sigma)))
-
-    x = np.arange(-radius, radius + 1)
-    kernel = np.exp(-0.5 * (x / sigma) ** 2)
-    kernel /= kernel.sum()
-
-    smoothed = np.convolve(df_full["prob"].to_numpy(), kernel, mode="same")
-    df_full["smoothed"] = smoothed
-
     # Expected value
     times = df["time_to_recover"].to_numpy(dtype=float)
     probs = df["prob"].to_numpy(dtype=float)
@@ -131,6 +336,7 @@ def compute_distribution_stats(N: int, D: int, distribution: dict):
     expected_time = float(np.sum(times * probs))
 
     # Downsample for plotting
+    range_len = t_max - t_min + 1
     max_points = 500
     if range_len > max_points:
         bin_size = int(math.ceil(range_len / max_points))
@@ -142,25 +348,50 @@ def compute_distribution_stats(N: int, D: int, distribution: dict):
             .agg(
                 time_to_recover=("time_to_recover", "mean"),
                 prob=("prob", "sum"),
-                smoothed=("smoothed", "mean"),
             )
             .reset_index(drop=True)
         )
     else:
-        df_plot = df_full[["time_to_recover", "prob", "smoothed"]].copy()
+        df_plot = df_full[["time_to_recover", "prob"]].copy()
 
     payload_bits = math.log2(D)
     transmitted_bits = expected_time * N
+    saturation = payload_bits / N
+    permeability = expected_data_size / (expected_data_size + expected_burst_size)
+    ideal_time = expected_time * permeability
+    ideal_transmitted_bits = transmitted_bits * permeability
     return {
-        "expected_time": expected_time,
         "plot_df": df_plot,
-        "sigma": sigma,
-        "t_min": t_min,
-        "t_max": t_max,
-        "packet_efficiency": payload_bits
-        / expected_time,  # how many payload bits per transmitted packet
-        "bit_efficency": payload_bits
-        / transmitted_bits,  # how many payload bits per transmitted bit
+        "metrics": {
+            "basic": {
+                "expected_sample_data_size": expected_data_size,
+                "expected_sample_burst_size": expected_burst_size,
+                "expected_time_to_recover": expected_time,
+                "packet_size": N,
+                "payload_bits": payload_bits,
+            },
+            "derived": {
+                "transmitted_bits": transmitted_bits,
+                "saturation": saturation,  # how many packets are needed to enocode raw payload
+                "bit_efficency": payload_bits
+                / transmitted_bits,  # how many payload bits per transmitted bit
+                "packet_efficiency": payload_bits
+                / expected_time,  # how many payload bits per transmitted packet
+                "bit_redundancy": transmitted_bits
+                - payload_bits,  # how many extra bits were sent
+                "packet_redundancy": expected_time
+                - saturation,  # how many extra bits were sent
+                "permeability": permeability,
+                "ideal_time_to_recover": ideal_time,
+                "ideal_transmitted_bits": ideal_transmitted_bits,
+                "ideal_bit_efficency": payload_bits
+                / ideal_transmitted_bits,  # bit_efficency / permeability
+                "ideal_packet_efficiency": payload_bits
+                / ideal_time,  # packet_efficiency / permeability
+                "ideal_bit_redundancy": ideal_transmitted_bits - payload_bits,
+                "ideal_packet_redundancy": ideal_time - saturation,
+            },
+        },
     }
 
 
@@ -170,8 +401,7 @@ def render_distribution(stats):
         print("Nothing to plot.")
         return
 
-    expected_time = stats["expected_time"]
-    sigma = stats["sigma"]
+    expected_time = stats["metrics"]["basic"]["expected_time_to_recover"]
 
     fig = go.Figure()
 
@@ -186,19 +416,8 @@ def render_distribution(stats):
         )
     )
 
-    # Smoothed line
-    fig.add_trace(
-        go.Scatter(
-            x=plot_df["time_to_recover"],
-            y=plot_df["smoothed"],
-            mode="lines",
-            name=f"smoothed (sigma={sigma:.2f})",
-            line=dict(color="firebrick", width=2),
-        )
-    )
-
     # Vertical expected value line
-    ymax = max(float(plot_df["prob"].max()), float(plot_df["smoothed"].max()))
+    ymax = float(plot_df["prob"].max())
 
     fig.add_shape(
         type="line",
@@ -207,18 +426,6 @@ def render_distribution(stats):
         y0=0,
         y1=ymax,
         line=dict(color="green", width=2, dash="dash"),
-    )
-
-    # Invisible trace to add a legend entry for expected value
-    fig.add_trace(
-        go.Scatter(
-            x=[expected_time],
-            y=[ymax],
-            mode="markers",
-            marker=dict(color="green", size=8),
-            name=f"expected = {expected_time:.2f}",
-            showlegend=True,
-        )
     )
 
     fig.update_layout(
@@ -237,9 +444,11 @@ def visual_benchmark(
     N: int,
     D: int,
     passes: int = 100,
-    sample_burst_size: Callable[[], int] = lambda: random.randint(1, 10),
-    sample_data_size: Callable[[], int] = lambda: random.randint(3, 5),
+    sample_burst_size: Callable[[], int] = _visual_default_sample_burst_size,
+    sample_data_size: Callable[[], int] = _visual_default_sample_data_size,
     iters_bound: int = 300,
+    processes: int | None = None,
+    progress_update: int = 100,
 ):
     return compute_distribution_stats(
         N,
@@ -253,5 +462,7 @@ def visual_benchmark(
             sample_burst_size,
             sample_data_size,
             iters_bound,
+            processes,
+            progress_update,
         ),
     )
