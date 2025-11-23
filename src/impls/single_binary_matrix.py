@@ -3,6 +3,52 @@ import random
 
 from ._interface import Producer, Recoverer
 
+# ---------- Nonlinear family (invertible ANF-based toggles) ----------
+
+
+def _bit_for_index(n: int, idx: int) -> int:
+    """Return bitmask (MSB-first) for coordinate ``idx`` in an n-bit vector."""
+    return 1 << (n - 1 - idx)
+
+
+def anf_toggle_family(n: int) -> list[tuple[int, int]]:
+    """
+    Enumerate an invertible family of nonlinear maps over GF(2)^n.
+
+    Each element is a pair (target_idx, mask) describing the permutation
+        f(x) = x with coordinate target_idx toggled iff all bits in `mask` are 1.
+
+    Constraints for invertibility:
+        - mask is non-empty
+        - target_idx bit is NOT included in mask (triangular update, involutive)
+
+    Ordering: target_idx ascending, then mask ascending.
+    """
+    family: list[tuple[int, int]] = []
+    for target in range(n):
+        target_bit = _bit_for_index(n, target)
+        for mask in range(1, 1 << n):
+            if mask & target_bit:
+                continue  # keep the target outside the condition for invertibility
+            family.append((target, mask))
+    return family
+
+
+def eval_anf_toggle(
+    family: list[tuple[int, int]], idx: int, vec: np.ndarray
+) -> np.ndarray:
+    """
+    Apply the idx-th toggle from `family` to vector `vec` (returns a copy).
+    """
+    target, mask = family[idx]
+    x_int = vector_to_int(vec)
+    if (x_int & mask) == mask:
+        out = vec.copy()
+        out[target] ^= 1
+        return out
+    return vec.copy()
+
+
 # ---------- Helper functions ----------
 
 
@@ -54,6 +100,65 @@ def in_span(v, basis):
     return v == 0
 
 
+_DEFAULT_NONLINEAR: dict[int, tuple[list[np.ndarray], list[int]]] = {}
+
+
+def _default_nonlinear(n: int) -> tuple[list[np.ndarray], list[int]]:
+    """
+    Generate (and memoize) seven known matrices (B..H) and eight distinct
+    nonlinear toggle indices (f0..f7) for size n.
+    """
+    if n in _DEFAULT_NONLINEAR:
+        return _DEFAULT_NONLINEAR[n]
+
+    family = anf_toggle_family(n)
+    if len(family) < 8:
+        raise ValueError(f"Not enough nonlinear toggles available for n={n}")
+
+    rng = np.random.default_rng()
+    f_indices = rng.choice(len(family), size=8, replace=False).astype(int).tolist()
+    mats = [
+        rng.integers(0, 2, size=(n, n), dtype=np.uint8) for _ in range(7)
+    ]  # B..H for f1..f7
+
+    _DEFAULT_NONLINEAR[n] = (mats, f_indices)
+    return _DEFAULT_NONLINEAR[n]
+
+
+def _resolve_nonlinear(
+    n: int,
+    B_list: list[np.ndarray] | None,
+    f0_idx: int | None,
+    f1_idx: int | None,
+    f_indices_full: list[int] | None = None,
+) -> tuple[list[tuple[int, int]], list[np.ndarray], list[int]]:
+    """Resolve the known nonlinear toggles/matrices for this size (lazy-random defaults)."""
+    family = anf_toggle_family(n)
+    if B_list is None or f_indices_full is None:
+        B_list_def, f_indices_def = _default_nonlinear(n)
+    else:
+        B_list_def, f_indices_def = B_list, f_indices_full
+
+    if B_list is None:
+        B_list = B_list_def
+    else:
+        B_list = [np.array(M, dtype=np.uint8) for M in B_list]
+
+    if f_indices_full is None:
+        if f0_idx is None or f1_idx is None:
+            f_indices = f_indices_def
+        else:
+            f_indices = f_indices_def
+    else:
+        f_indices = f_indices_full
+
+    assert len(B_list) == 7, "Need seven known matrices for f1..f7"
+    assert len(f_indices) == 8, "Need eight toggle indices f0..f7"
+    for idx in f_indices:
+        assert 0 <= idx < len(family), "f indices must reference the ANF toggle family for n"
+    return family, B_list, f_indices
+
+
 # ---------- new rank / unrank for *all* matrices ----------
 
 
@@ -95,13 +200,25 @@ class MatrixProducer(Producer):
     If only cycles remain, pick any vector from those cycles.
     """
 
-    def __init__(self, n: int, index: int, verbose: bool = False):
+    def __init__(
+        self,
+        n: int,
+        index: int,
+        B_list: list[np.ndarray] | None = None,
+        f0_idx: int | None = None,
+        f1_idx: int | None = None,
+        f_indices: list[int] | None = None,
+        verbose: bool = False,
+    ):
         self.n = n
         self.index = index
         self.verbose = verbose
 
         # Build generator matrix from payload bits
         self.A = index_to_matrix(n, index)
+        self.family, self.B_list, self.f_indices = _resolve_nonlinear(
+            n, B_list, f0_idx, f1_idx, f_indices_full=f_indices
+        )
 
         # Precompute successor and predecessor graph
         self._build_graph()
@@ -130,17 +247,24 @@ class MatrixProducer(Producer):
 
     # ------------------------------------------------------------
     def _build_graph(self):
-        """Build successor and predecessor lists for x -> A x."""
+        """Build successor and predecessor lists for x -> A f0(x) + f1(x)."""
         self.succ = {}
         self.pred = {i: [] for i in range(2**self.n)}
 
         for x in range(2**self.n):
             v = self._int_to_vec(x)
-            nxt = (self.A @ v) % 2
+            nxt = self._update_vec(v)
             y = self._vec_to_int(nxt)
 
             self.succ[x] = y
             self.pred[y].append(x)
+
+    def _update_vec(self, vec: np.ndarray) -> np.ndarray:
+        f_vals = [eval_anf_toggle(self.family, idx, vec) for idx in self.f_indices]
+        acc = (self.A @ f_vals[0]) % 2
+        for M, fv in zip(self.B_list, f_vals[1:]):
+            acc ^= (M @ fv) % 2
+        return acc
 
     # ------------------------------------------------------------
     def _find_tails(self) -> list[int]:
@@ -195,7 +319,7 @@ class MatrixProducer(Producer):
                 self.unvisited.remove(start)
 
             vec = self._int_to_vec(start)
-            nxt = (self.A @ vec) % 2
+            nxt = self._update_vec(vec)
             self.curr = self._vec_to_int(nxt)
             self.after_separator = False
 
@@ -213,7 +337,7 @@ class MatrixProducer(Producer):
             self.unvisited.remove(self.curr)
 
         vec = self._int_to_vec(self.curr)
-        nxt = (self.A @ vec) % 2
+        nxt = self._update_vec(vec)
         self.curr = self._vec_to_int(nxt)
         self.after_separator = False
 
@@ -228,13 +352,19 @@ class MatrixProducer(Producer):
 
 class MatrixRecoverer(Recoverer):
     """
-    Recoverer for arbitrary binary n×n matrices A.
+    Recoverer for arbitrary binary n×n matrices A with known nonlinear part.
+
+    Update rule: x_{t+1} = A f0(x_t) + Σ_{i=1..7} B_i f_i(x_t) over GF(2),
+    where the seven matrices B_i and the eight toggle indices f_i are known.
 
     From the stream of n-bit packets (with zero separators and possible None gaps),
-    we collect distinct transitions (u -> w) that correspond to u, w ≠ 0 and
-    occur consecutively without a separator. These are guaranteed to satisfy w = A u.
+    we collect distinct transitions (u -> w) with u, w ≠ 0 observed consecutively.
+    These satisfy w = A f0(u) + Σ B_i f_i(u). We rewrite to a linear form:
 
-    Once we have n linearly independent u's, we solve Y = A X over GF(2):
+        u_eff = f0(u)
+        w_eff = w XOR Σ B_i f_i(u) = A u_eff
+
+    Once we have n linearly independent u_eff columns, we solve Y = A X over GF(2):
 
         X = [u_1, ..., u_n],  Y = [w_1, ..., w_n]
         A = Y X^{-1}  (in GF(2))
@@ -242,10 +372,21 @@ class MatrixRecoverer(Recoverer):
     Then we map A back to the payload integer by matrix_to_index(A).
     """
 
-    def __init__(self, n: int, verbose: bool = False):
+    def __init__(
+        self,
+        n: int,
+        B_list: list[np.ndarray] | None = None,
+        f0_idx: int | None = None,
+        f1_idx: int | None = None,
+        f_indices: list[int] | None = None,
+        verbose: bool = False,
+    ):
         self.n = n
         self.verbose = verbose
 
+        self.family, self.B_list, self.f_indices = _resolve_nonlinear(
+            n, B_list, f0_idx, f1_idx, f_indices_full=f_indices
+        )
         self.prev: np.ndarray | None = None
         # Store all unique transitions as (u_bits, w_bits) tuples
         self.transitions: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
@@ -272,13 +413,21 @@ class MatrixRecoverer(Recoverer):
 
         # Record a transition (prev -> data) if we have a valid prev
         if self.prev is not None and not np.all(self.prev == 0):
-            key = (tuple(self.prev.tolist()), tuple(data.tolist()))
+            u_raw = self.prev
+            w_raw = data
+            f_vals = [eval_anf_toggle(self.family, idx, u_raw) for idx in self.f_indices]
+            u_eff = f_vals[0]
+            correction = np.zeros(self.n, dtype=np.uint8)
+            for M, fv in zip(self.B_list, f_vals[1:]):
+                correction ^= (M @ fv) % 2
+            w_eff = (w_raw ^ correction) % 2
+            key = (tuple(u_eff.tolist()), tuple(w_eff.tolist()))
             if key not in self.transitions:
                 self.transitions.add(key)
                 if self.verbose:
                     print(
                         f"[Recoverer] + transition #{len(self.transitions)}: "
-                        f"{''.join(map(str, self.prev))} -> {''.join(map(str, data))}"
+                        f"{''.join(map(str, u_eff))} -> {''.join(map(str, w_eff))}"
                     )
             elif self.verbose:
                 print(
@@ -374,13 +523,30 @@ class MatrixRecoverer(Recoverer):
 
 override_D = lambda n: 2 ** (n * n)
 
+# Module-level default nonlinear pieces (sampled at import/reload time)
+_GLOBAL_DEFAULTS: dict[int, tuple[list[np.ndarray], list[int]]] = {}
+
+
+def _init_global_defaults(n: int) -> tuple[list[np.ndarray], list[int]]:
+    if n in _GLOBAL_DEFAULTS:
+        return _GLOBAL_DEFAULTS[n]
+    family = anf_toggle_family(n)
+    rng = np.random.default_rng()
+    f_indices = rng.choice(len(family), size=8, replace=False).astype(int).tolist()
+    mats = [rng.integers(0, 2, size=(n, n), dtype=np.uint8) for _ in range(7)]
+    _GLOBAL_DEFAULTS[n] = (mats, f_indices)
+    return _GLOBAL_DEFAULTS[n]
+
 
 def producer_constructor(index: int, n: int, d: int) -> Producer:
     # All n×n binary matrices are allowed: total payload size 2^(n^2)
     assert d == 2 ** (n * n)
-    return MatrixProducer(n, index)
+    mats, f_indices = _init_global_defaults(n)
+    return MatrixProducer(n, index, B_list=mats, f_indices=f_indices)
 
 
 def recoverer_constructor(n: int, d: int) -> Recoverer:
     assert d == 2 ** (n * n)
-    return MatrixRecoverer(n)
+
+    mats, f_indices = _init_global_defaults(n)
+    return MatrixRecoverer(n, B_list=mats, f_indices=f_indices)
