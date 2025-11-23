@@ -155,7 +155,9 @@ def _resolve_nonlinear(
     assert len(B_list) == 7, "Need seven known matrices for f1..f7"
     assert len(f_indices) == 8, "Need eight toggle indices f0..f7"
     for idx in f_indices:
-        assert 0 <= idx < len(family), "f indices must reference the ANF toggle family for n"
+        assert (
+            0 <= idx < len(family)
+        ), "f indices must reference the ANF toggle family for n"
     return family, B_list, f_indices
 
 
@@ -415,7 +417,9 @@ class MatrixRecoverer(Recoverer):
         if self.prev is not None and not np.all(self.prev == 0):
             u_raw = self.prev
             w_raw = data
-            f_vals = [eval_anf_toggle(self.family, idx, u_raw) for idx in self.f_indices]
+            f_vals = [
+                eval_anf_toggle(self.family, idx, u_raw) for idx in self.f_indices
+            ]
             u_eff = f_vals[0]
             correction = np.zeros(self.n, dtype=np.uint8)
             for M, fv in zip(self.B_list, f_vals[1:]):
@@ -453,7 +457,6 @@ class MatrixRecoverer(Recoverer):
         ws: list[np.ndarray] = []
         basis: list[int] = []  # RREF basis of chosen u's (as int bitmasks)
 
-        # TODO: with this greedy approach, we might miss some valid basis, generally we need to consider all the n choose len(transitions) subsets
         for u_bits, w_bits in self.transitions:
             u = np.array(u_bits, dtype=np.uint8)
             umask = vector_to_int(u)
