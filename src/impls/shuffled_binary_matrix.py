@@ -193,6 +193,8 @@ def matrix_to_index(A: np.ndarray) -> int:
 # ---------- Producer ----------
 
 
+# This is working like x = A@f0(x) + B@f1(x) + ... + H@f7(x), with only A varying. (actually x = A@x + B@f(x) is enough for the maximal effiecenty of this approach)
+# This provides better efficency than just x = A@x, x = A@f(x), x = A@x + f(x)
 class MatrixProducer(Producer):
     """
     Producer for arbitrary binary n×n matrices (no full-rank restriction),
