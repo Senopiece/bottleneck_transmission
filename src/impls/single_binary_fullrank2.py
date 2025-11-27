@@ -196,6 +196,8 @@ def count_fullrank_matrices(n):
     return prod(2**n - 2**i for i in range(n))
 
 
+# Some further path to try
+# https://chatgpt.com/share/69283060-7610-800c-9947-27db904c32df
 class FullrankProducer(Producer):
     """
     Producer that:
