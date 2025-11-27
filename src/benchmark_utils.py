@@ -22,14 +22,6 @@ def _default_sample_data_size() -> int:
     return random.randint(3, 30)
 
 
-def _visual_default_sample_burst_size() -> int:
-    return random.randint(1, 10)
-
-
-def _visual_default_sample_data_size() -> int:
-    return random.randint(3, 5)
-
-
 def _run_benchmark_chunk(
     producer_constructor: Callable[[int, int, int], Producer],
     recoverer_constructor: Callable[[int, int], Recoverer],
@@ -481,8 +473,8 @@ def visual_benchmark(
     N: int,
     D: int,
     passes: int = 100,
-    sample_burst_size: Callable[[], int] = _visual_default_sample_burst_size,
-    sample_data_size: Callable[[], int] = _visual_default_sample_data_size,
+    sample_burst_size: Callable[[], int] = _default_sample_burst_size,
+    sample_data_size: Callable[[], int] = _default_sample_data_size,
     iters_bound: int = 300,
     processes: int | None = None,
     progress_update: int = 100,
