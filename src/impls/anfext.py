@@ -3,6 +3,11 @@ import random
 
 from ._interface import Producer, Recoverer, GeneratorProducer
 
+# Works by generating transitions of the form:
+#     x = A@F(x)
+# Possible questions:
+# - Why ANF? - to make rank([F(0), F(1) ... F(2^n-1)]) = M
+# - Why to make rank([...]) = M? - coz we would need A = Y@F(X)^-1
 
 # ================================================================
 # ======================  Helper functions  ======================
