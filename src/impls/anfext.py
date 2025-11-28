@@ -326,9 +326,10 @@ class NonlinearRecoverer(Recoverer):
 # ========  D, producer_constructor, recoverer_constructor  ======
 # ================================================================
 
-# theoretically can handle up to D = 2^(n*2^n)
-# but in practice limit to smaller D since large M starts to fail
-override_D = lambda n: 2 ** (n * 16)
+# theoretically can handle up to D = 2^(n*2^n), where M=2^n
+# but in practice large M starts to fail
+# TODO: explore why it fails
+override_D = lambda n: 2 ** (n * (2 ** (n - 1)))
 
 
 def _infer_m_from_d(n, d):
