@@ -10,5 +10,28 @@ TODO: generalize to be able to transfer arbitary amount of data
      - some known matrix entries to reduce the amount of information to transfer
      - resulting vector is concat of results of multiple smaller matrices (e.g. 3x3 and 2x2) to reduce the amount of information to transfer
 TODO: investigate is there a way to make sequences that they provide linearly independent vectors faster? like maybe insert more zeros, but choose such a patches that there are more linearly independent vectors?
+TODO: optimize the algorithms now for the execution time
 
 - Investigate why fullrank appears to be better
+
+
+Other ideas:
+1. shuffle matrix
+    A = D_{NxM}S_{MxM}, where S is a fullrank matrix, D is payload data matrix
+    s.t. instead of Y = DX update we will have Y = AX => D = YX^-1S^-1
+2. redundant matrix
+    A = [D Z], where D is actual variable, and Z is fixed
+    then Y = AX to Y = DX_u + ZX_l, where ZX_l is constant term and thus
+    D = (Y + ZX_l)X_u^-1
+    Therefore it does not require to collect more data than with just A = D,
+    but shuffles the space better, hence maybe better convergence
+3. 1 + 2 - the implementation that uses this shuffling is named with postfix r
+    A = [D Z]S
+    Y = AX
+    Y = [D Z]SX
+    U = SX
+    Y = [D Z]U
+    Y = DU_u + ZU_l
+    D = (Y + ZU_l)U_u^-1
+
+    this shuffles the space twice coz why not
