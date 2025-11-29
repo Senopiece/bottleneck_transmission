@@ -563,7 +563,7 @@ def _infer_m_from_d(n: int, d: int) -> int:
     """
     Given n and d, find m >= n such that d == count_fullrank_nm(n, m).
     """
-    max_m = 1 << n  # monomial limit
+    max_m = (1 << n) - 1  # monomial limit
     for m in range(n, max_m + 1):
         if count_fullrank_nm(n, m) == d:
             return m
