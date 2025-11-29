@@ -3,6 +3,9 @@ import random
 
 from ._interface import Producer, Recoverer, GeneratorProducer
 
+# NOTE: fails to transmit some degenerate payloads e.g. D = 0
+
+
 # Better nonlinear_producer compared to anfext_fullrank.py:
 # Different monomial feature map compared to anfext_fullrank2.py
 #     > there it is like that always F(0) = 0

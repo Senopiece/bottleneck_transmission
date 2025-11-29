@@ -8,6 +8,8 @@ from .single_binary_fullrank import (
     unrank_fullrank_matrix,
 )
 
+# NOTE: fails to transmit some degenerate payloads e.g. D = 0
+
 
 # ---------- Nonlinear family (invertible ANF-based toggles) ----------
 
@@ -528,8 +530,8 @@ class FullrankMatrixProducer(MatrixProducer):
         f_indices: list[int] | None = None,
         verbose: bool = False,
     ):
-        assert 0 <= index < count_fullrank_matrices(
-            n
+        assert (
+            0 <= index < count_fullrank_matrices(n)
         ), "index out of range for full-rank matrices"
         self.payload_index = index
 

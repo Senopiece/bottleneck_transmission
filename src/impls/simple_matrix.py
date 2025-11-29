@@ -2,6 +2,9 @@ import numpy as np
 
 from ._interface import Producer, Recoverer, GeneratorProducer
 
+# NOTE: fails to transmit some degenerate payloads e.g. D = 0
+
+
 # ---------- Helper functions ----------
 
 

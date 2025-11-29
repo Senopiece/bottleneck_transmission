@@ -11,6 +11,7 @@ TODO: generalize to be able to transfer arbitary amount of data
      - resulting vector is concat of results of multiple smaller matrices (e.g. 3x3 and 2x2) to reduce the amount of information to transfer
 TODO: investigate is there a way to make sequences that they provide linearly independent vectors faster? like maybe insert more zeros, but choose such a patches that there are more linearly independent vectors?
 TODO: optimize the algorithms now for the execution time
+TODO: mb relax single_binary_fullrank to some single_binary_smth to still make sure no degenerate payloads, but more payloads than fullrank matrices? - looks like no
 
 - Investigate why fullrank appears to be better
 

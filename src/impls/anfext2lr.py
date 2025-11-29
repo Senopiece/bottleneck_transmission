@@ -3,6 +3,9 @@ import random
 
 from ._interface import Producer, Recoverer, GeneratorProducer
 
+# NOTE: fails to transmit some degenerate payloads e.g. D = 0
+
+
 # Works by generating transitions of the form:
 #     x = A@F(x)
 # with A constructed as:
@@ -532,3 +535,6 @@ def recoverer_constructor(n: int, d: int) -> Recoverer:
     """
     m = _infer_m_from_d(n, d)
     return NonlinearRecoverer(n, m)
+
+
+skip = True

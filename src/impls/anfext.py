@@ -3,6 +3,9 @@ import random
 
 from ._interface import Producer, Recoverer, GeneratorProducer
 
+# NOTE: fails to transmit some degenerate payloads e.g. D = 0
+
+
 # Works by generating transitions of the form:
 #     x = A@F(x)
 # Possible questions:
@@ -328,7 +331,8 @@ class NonlinearRecoverer(Recoverer):
 
 # theoretically can handle up to D = 2^(n*2^n), where M=2^n
 # but in practice large M starts to fail
-# TODO: explore why it fails
+# NOTE: the bigger M the higher the probability for
+#       a random payload to be degenerate
 override_D = lambda n: 2 ** (n * (2 ** (n - 1)))
 
 

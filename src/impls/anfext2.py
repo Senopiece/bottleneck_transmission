@@ -3,6 +3,9 @@ import random
 
 from ._interface import Producer, Recoverer, GeneratorProducer
 
+# NOTE: fails to transmit some degenerate payloads e.g. D = 0
+
+
 # Works by generating transitions of the form:
 #     x = A@F(x)
 # Possible questions:
