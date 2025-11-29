@@ -96,7 +96,7 @@ def nonlinear_producer(
     m: int,
     index: int,
     d: int,
-    allow_consecutive_repetitions: bool = True,
+    allow_consecutive_repetitions: bool = False,
     verbose: bool = False,
 ):
     """
