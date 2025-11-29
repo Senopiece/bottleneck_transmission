@@ -16,6 +16,11 @@ from ._interface import Producer, Recoverer, GeneratorProducer
 #   split U = (U_u, U_l) with U_u ∈ GF(2)^m, U_l ∈ GF(2)^{M-m}
 #   Y = D U_u + Z U_l  ⇒  D = (Y + Z U_l) U_u^{-1}
 #
+
+# For now S = const gray code permutation
+#         Z = determenistically rand N x (2^N - 1 - M)
+# TODO: find better ways to construct (S, Z) given N and M
+
 # ================================================================
 # ======================  Helper functions  ======================
 # ================================================================
