@@ -26,12 +26,13 @@ Other ideas:
     Therefore it does not require to collect more data than with just A = D,
     but shuffles the space better, hence maybe better convergence
 3. 1 + 2 - the implementation that uses this shuffling is named with postfix r
-    A = [D Z]S
+    A = [D Z]S, S = [S_u S_l]^T, where Z is any, S_u invertible, S_l can be any too
     Y = AX
     Y = [D Z]SX
-    U = SX
+    U = SX, U = [U_u U_l]^T = [S_u S_l]^T X, U_u = S_u X, U_l = S_l X
     Y = [D Z]U
-    Y = DU_u + ZU_l
-    D = (Y + ZU_l)U_u^-1
+    Y = D U_u + Z U_l
+    D = (Y + Z U_l) U_u^-1
+    D = (Y + Z S_l X) X^-1 S_u^-1
 
     this shuffles the space twice coz why not
