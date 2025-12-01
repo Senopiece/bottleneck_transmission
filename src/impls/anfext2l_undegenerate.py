@@ -18,18 +18,31 @@ from ._interface import Producer, Recoverer, GeneratorProducer
 #        payload_index <--> GOOD MATRIX A
 #
 #      where "good" matrices are exactly those that remain
-#      recoverable under the traversal protocol.
+#      recoverable under the traversal protocol *even when the
+#      following transitions are not observed*:
+#
+#          (0,0), (x,0), (0,x), (x,x)
 #
 #      The mapping uses:
 #          A = Y X^{-1}
 #      where X is a fixed m×m invertible matrix of feature vectors
-#      F(x_i), and Y is composed of m independent nonzero n-bit
-#      columns encoded from the payload index in base-(2^n−1).
+#      F(x_i), and Y is composed of m n-bit columns chosen from the
+#      allowed set:
 #
-#      Recoverer now returns the payload index, NOT the raw matrix
-#      index.
+#           allowed_i = {1..2^n-1} \ {x_i}
 #
-# ================================================================
+#      This guarantees:
+#          y_i != 0        → (x_i,0) not produced
+#          y_i != x_i      → (x_i,x_i) not produced
+#      and x_i != 0        → (0,x_i) never produced by basis picks
+#
+#      Therefore the recoverer ALWAYS sees the m transitions
+#      (x_i → y_i), builds X and Y, solves A = Y X^{-1}, and then
+#      recovers payload_index back from Y.
+#
+#      Recoverer now returns the payload index, NOT the raw A bits.
+#
+# ===============================================================
 
 # ================================================================
 # ======================  Helper functions  ======================
@@ -110,10 +123,11 @@ def anf_feature_vector(x_bits, monomial_masks):
 
 def build_feature_basis(n, m, masks):
     """
-    Construct a basis of size m from nonzero x ∈ {1,2,...,2^n−1}
+    Construct a basis of size m from nonzero x ∈ {1,..,2^n−1}
     such that F(x_i) are linearly independent.
+
     Returns:
-        x_basis  : list of m integers in [1, 2^n−1]
+        x_basis  : list of m integers in [1,2^n−1]
         X        : m×m matrix whose columns are F(x_i)
         Xinv     : its inverse mod2
     """
@@ -121,7 +135,7 @@ def build_feature_basis(n, m, masks):
     x_basis = []
     Fcols = []
 
-    for x in range(1, 1 << n):  # skip x=0 because F(0)=0
+    for x in range(1, 1 << n):  # skip x=0 (F(0)=0 gives no rank)
         xb = np.array([(x >> (n - 1 - i)) & 1 for i in range(n)], dtype=np.uint8)
         Fx = anf_feature_vector(xb, masks)
         indep, new_basis = add_to_basis_rref_vector(Fx, basis)
@@ -136,7 +150,8 @@ def build_feature_basis(n, m, masks):
         raise ValueError("Could not build feature basis for mapping.")
 
     X = np.column_stack(Fcols)
-    # invert X
+
+    # invert X mod 2
     M = X.shape[0]
     aug = np.concatenate([X.copy(), np.eye(M, dtype=np.uint8)], axis=1)
     for i in range(M):
@@ -156,38 +171,57 @@ def build_feature_basis(n, m, masks):
     return x_basis, X, Xinv
 
 
-def encode_payload_index_to_Y(index, n, m):
+# >>> ADDED: forbid y_i in {0, x_i} to avoid erased transitions
+def encode_payload_index_to_Y(index, n, m, x_basis):
     """
-    Convert payload index (0 ≤ index < (2^n−1)^m) into
-    Y ∈ GF(2)^{n×m} whose columns are nonzero n-bit vectors.
+    Convert payload index (0 ≤ index < (2^n−2)^m) into
+    Y ∈ GF(2)^{n×m}, with each column y_i chosen from:
+
+         allowed_i = {1..2^n-1} \ {x_i}
+
+    This guarantees:
+        y_i != 0        (avoids (x_i,0))
+        y_i != x_i      (avoids (x_i,x_i))
+
+    and x_i != 0 by construction.
     """
-    q = (1 << n) - 1
+    all_vals = list(range(1, 1 << n))  # all nonzero n-bit vectors
     cols = []
-    for _ in range(m):
+    q = (1 << n) - 2  # base size = 2^n - 2
+
+    for i in range(m):
+        allowed = [v for v in all_vals if v != x_basis[i]]
         d = index % q
         index //= q
-        val = d + 1
-        col = np.array([(val >> (n - 1 - i)) & 1 for i in range(n)], dtype=np.uint8)
+        val = allowed[d]
+        col = np.array([(val >> (n - 1 - j)) & 1 for j in range(n)], dtype=np.uint8)
         cols.append(col)
+
     return np.column_stack(cols)
 
 
-def decode_Y_to_payload_index(Y, n, m):
+def decode_Y_to_payload_index(Y, n, m, x_basis):
     """
-    Convert Y ∈ GF(2)^{n×m} back to payload index.
-    Each column must be nonzero.
+    Decode Y back into payload index using the same
+    per-column allowed_i sets.
     """
-    q = (1 << n) - 1
+    all_vals = list(range(1, 1 << n))
+    q = (1 << n) - 2
     index = 0
     base = 1
+
     for i in range(m):
         col = Y[:, i]
         val = 0
         for b in col:
             val = (val << 1) | int(b)
-        d = val - 1
+
+        allowed = [v for v in all_vals if v != x_basis[i]]
+        d = allowed.index(val)
+
         index += d * base
         base *= q
+
     return index
 
 
@@ -214,23 +248,22 @@ def nonlinear_producer(
     NOW:
         payload_index → Y → A = Y X^{-1}
 
-    This guarantees that all produced matrices A are recoverable,
-    because columns of Y correspond to a full-rank set of F(x_i)
-    and are forced to be nonzero.
+    And the columns y_i of Y are chosen to avoid:
+        (x_i,0), (x_i,x_i)
+    so they remain visible even when transitions are erased.
     """
-    assert d == ((1 << n) - 1) ** m or d == 2 ** (
-        n * m
-    ), "d must match payload space (extended mapping)"
+    assert d == ((1 << n) - 2) ** m, "d must be (2^n - 2)^m for censor-proof mapping"
 
     masks = generate_monomial_masks(n, m)
 
     # >>> ADDED: build basis and mapping
     x_basis, X, Xinv = build_feature_basis(n, m, masks)
-    Y = encode_payload_index_to_Y(payload_index, n, m)
+    Y = encode_payload_index_to_Y(payload_index, n, m, x_basis)
     A = (Y @ Xinv) % 2
 
     if verbose:
         print("[Producer] Mapped payload to A via Y X^{-1}:")
+        print("x_basis =", x_basis)
         print("Y=\n", Y)
         print("A=\n", A)
 
@@ -298,7 +331,7 @@ def nonlinear_producer(
 
 
 class NonlinearRecoverer(Recoverer):
-    """Recover payload_index from transitions (x → y = A F(x))."""
+    """Recover payload_index from visible transitions (x → y = A F(x))."""
 
     def __init__(self, n, m, verbose=False):
         self.n = n
@@ -326,8 +359,7 @@ class NonlinearRecoverer(Recoverer):
             return self.recovered_payload_index
 
         if self.prev is not None and not np.all(self.prev == 0):
-            pair = (tuple(self.prev.tolist()), tuple(data.tolist()))
-            self.transitions.add(pair)
+            self.transitions.add((tuple(self.prev.tolist()), tuple(data.tolist())))
         self.prev = data.copy()
 
         if self.recovered_payload_index is not None:
@@ -358,17 +390,17 @@ class NonlinearRecoverer(Recoverer):
         if count < self.m:
             return None
 
-        X = np.column_stack(UX)
-        Y = np.column_stack(UY)
+        Xobs = np.column_stack(UX)
+        Yobs = np.column_stack(UY)
 
         try:
-            A = self._solve_mod2(Y, X)
+            A = self._solve_mod2(Yobs, Xobs)
         except:
             return None
 
-        # >>> ADDED: recover payload index from A
+        # >>> ADDED: recover payload index
         Yrec = (A @ self.X) % 2
-        payload_index = decode_Y_to_payload_index(Yrec, self.n, self.m)
+        payload_index = decode_Y_to_payload_index(Yrec, self.n, self.m, self.x_basis)
 
         self.recovered_payload_index = payload_index
         return payload_index
@@ -401,25 +433,24 @@ class NonlinearRecoverer(Recoverer):
 
 def override_D(n):
     """
-    Note: the maximal guaranteed-recoverable payload size is:
-        D = (2^n - 1)^m
-    for m in [1, 2^n)
+    For censor-proof mapping, maximal guaranteed-recoverable payload:
+        D = (2^n - 2)^m
     """
-    return ((1 << n) - 1) ** 13
+    return ((1 << n) - 2) ** 13  # placeholder; caller chooses m=13
 
 
 def _infer_m_from_d(n, d):
     """
-    Infer m from payload size D = (2^n - 1)^m.
+    Infer m from payload size D = (2^n - 2)^m.
     """
-    q = (1 << n) - 1
+    q = (1 << n) - 2
     m = 0
     prod = 1
     while prod < d:
         prod *= q
         m += 1
     if prod != d:
-        raise ValueError("d is not a power of (2^n - 1)")
+        raise ValueError("d is not a power of (2^n - 2)")
     return m
 
 
@@ -431,7 +462,3 @@ def producer_constructor(index: int, n: int, d: int) -> Producer:
 def recoverer_constructor(n: int, d: int) -> Recoverer:
     m = _infer_m_from_d(n, d)
     return NonlinearRecoverer(n, m)
-
-
-# TODO: also account for that y = AF(x) is not allowed for y = x, formalize this as external constraint that this impl is following
-# TODO: maybe not to remove constant term, but restrict A to be such that only AF(x) = x works only for x = 0, and no other x is mapping to 0 also (so no AF(x) = 0 for any nonzero x)
