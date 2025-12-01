@@ -196,6 +196,7 @@ def decode_Y_to_payload_index(Y, n, m):
 # ================================================================
 
 
+# TODO: try other strategies
 def nonlinear_producer(
     n: int,
     m: int,
@@ -252,6 +253,7 @@ def nonlinear_producer(
         yb = (A @ F) % 2
         return vec_to_int(yb)
 
+    # TODO: for large N this becomes unfeasible, make some optimizations
     Nstates = 1 << n
     incoming_count = [0] * Nstates
     for x in range(Nstates):
@@ -433,5 +435,3 @@ def recoverer_constructor(n: int, d: int) -> Recoverer:
 
 # TODO: also account for that y = AF(x) is not allowed for y = x, formalize this as external constraint that this impl is following
 # TODO: maybe not to remove constant term, but restrict A to be such that only AF(x) = x works only for x = 0, and no other x is mapping to 0 also (so no AF(x) = 0 for any nonzero x)
-# TODO: write full fledged readme explaining why and how index map is derived under these constraints, understand it by myself
-# TODO: make a simple mapper from bytes to matrix A, maybe adding some constant block Z, such that payload is encoded in integer amount of bits
