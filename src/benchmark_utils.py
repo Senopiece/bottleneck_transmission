@@ -334,7 +334,14 @@ def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
     """
 
     # Allow callers to pass either the raw distribution or the dict returned by benchmark()
-    distribution = benchmark_result.get("distribution", {})
+    distribution_raw = benchmark_result.get("distribution", {})
+    distribution = {}
+    for k, v in distribution_raw.items():
+        try:
+            key_int = int(k)
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid time bucket key {k!r} in distribution")
+        distribution[key_int] = v
     expected_burst_size = benchmark_result.get("expected_sample_burst_size")
     expected_data_size = benchmark_result.get("expected_sample_data_size")
 
@@ -346,6 +353,8 @@ def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
 
     # Sorted distribution table
     df = pd.DataFrame(list(distribution.items()), columns=["time_to_recover", "prob"])
+    if not df.empty:
+        df = df.astype({"time_to_recover": "int64", "prob": float})
     df = df.sort_values("time_to_recover").reset_index(drop=True)
 
     t_min = int(df["time_to_recover"].min())
@@ -353,7 +362,7 @@ def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
 
     # Fill missing buckets
     full_idx = pd.Series(range(t_min, t_max + 1), name="time_to_recover")
-    df_full = pd.DataFrame({"time_to_recover": full_idx})
+    df_full = pd.DataFrame({"time_to_recover": full_idx.astype("int64")})
     df_full = df_full.merge(df, on="time_to_recover", how="left").fillna(0)
 
     # Expected value
