@@ -365,14 +365,6 @@ def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
     df_full = pd.DataFrame({"time_to_recover": full_idx.astype("int64")})
     df_full = df_full.merge(df, on="time_to_recover", how="left").fillna(0)
 
-    # Expected value
-    times = df["time_to_recover"].to_numpy(dtype=float)
-    probs = df["prob"].to_numpy(dtype=float)
-    total = probs.sum()
-    if abs(total - 1.0) > 1e-8:
-        probs = probs / total
-    expected_time = float(np.sum(times * probs))
-
     # Downsample for plotting
     range_len = t_max - t_min + 1
     max_points = 500
@@ -392,7 +384,25 @@ def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
     else:
         df_plot = df_full[["time_to_recover", "prob"]].copy()
 
+    # Expected value and spread
+    probs_full = df_full["prob"].to_numpy(dtype=float)
+    total = probs_full.sum()
+    if total <= 0:
+        raise ValueError("Distribution probabilities sum to zero")
+    probs_full = probs_full / total
+    times_full = df_full["time_to_recover"].to_numpy(dtype=float)
+    expected_time = float(np.sum(times_full * probs_full))
+    variance = float(np.sum(((times_full - expected_time) ** 2) * probs_full))
+    sigma = math.sqrt(max(variance, 0.0))
     payload_bits = math.log2(D)
+    safe_times = np.clip(times_full, 1e-12, None)
+    bit_eff_samples = payload_bits / (safe_times * N)
+    bit_eff_mean = float(np.sum(bit_eff_samples * probs_full))
+    bit_eff_variance = float(
+        np.sum(((bit_eff_samples - bit_eff_mean) ** 2) * probs_full)
+    )
+    bit_eff_sigma = math.sqrt(max(bit_eff_variance, 0.0))
+
     transmitted_bits = expected_time * N
     saturation = payload_bits / N
     permeability = expected_data_size / (expected_data_size + expected_burst_size)
@@ -405,14 +415,17 @@ def compute_distribution_stats(N: int, D: int, benchmark_result: dict):
                 "expected_sample_data_size": expected_data_size,
                 "expected_sample_burst_size": expected_burst_size,
                 "expected_time_to_recover": expected_time,
+                "std_time_to_recover": sigma,
                 "packet_size": N,
                 "payload_bits": payload_bits,
             },
             "derived": {
                 "transmitted_bits": transmitted_bits,
                 "saturation": saturation,  # how many packets are needed to enocode raw payload
-                "bit_efficency": payload_bits
-                / transmitted_bits,  # how many payload bits per transmitted bit
+                "bit_efficency": bit_eff_mean,
+                "bit_efficency_sigma": bit_eff_sigma,
+                "bit_efficency_ratio": payload_bits
+                / transmitted_bits,  # payload bits per transmitted bit using expected time
                 "packet_efficiency": payload_bits
                 / expected_time,  # how many payload bits per transmitted packet
                 "bit_redundancy": transmitted_bits
