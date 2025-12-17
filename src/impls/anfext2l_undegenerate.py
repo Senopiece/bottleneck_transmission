@@ -436,7 +436,7 @@ def override_D(n):
     For censor-proof mapping, maximal guaranteed-recoverable payload:
         D = (2^n - 2)^m
     """
-    return ((1 << n) - 2) ** 13  # placeholder; caller chooses m=13
+    return ((1 << n) - 2) ** (2 ** (n - 1))
 
 
 def _infer_m_from_d(n, d):
