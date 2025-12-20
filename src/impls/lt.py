@@ -130,15 +130,15 @@ def _robust_soliton_cdf(k: int, c: float = 0.1, delta: float = 0.05) -> list[flo
     return cdf
 
 
-def _subset_from_seed(seed: int, k: int, cdf: list[float]) -> list[int]:
+def _subset_from_seed(
+    seed: int, k: int, cdf: list[float], singleton_limit: int | None = None
+) -> list[int]:
     """Deterministically derive the neighbor set for a packet from ``seed``."""
     if k <= 0:
         return []
 
-    # Guarantee that the first k seeds map to singleton subsets. This ensures
-    # every source symbol can always be transmitted in isolation even when the
-    # header budget is tiny (important for very small n).
-    if seed < k:
+    limit = k if singleton_limit is None else max(0, min(singleton_limit, k))
+    if limit and seed < limit:
         return [seed]
 
     rng = random.Random(seed)
@@ -227,7 +227,9 @@ class LTProducer(Producer):
     def generate(self) -> np.ndarray:
         seed = self.rng.randrange(self.seed_space)
         header = _int_to_bits(seed, self.header_bits)
-        subset = _subset_from_seed(seed, self.k, self.degree_cdf)
+        subset = _subset_from_seed(
+            seed, self.k, self.degree_cdf, singleton_limit=self.k
+        )
         payload = self._xor_subset(subset)
         if self.header_bits == 0:
             return payload.astype(np.uint8)
@@ -316,7 +318,9 @@ class LTRecoverer(Recoverer):
         seed_bits = packet[: self.header_bits]
         payload_bits = packet[self.header_bits :]
         seed = _bits_to_int(seed_bits.tolist())
-        subset = _subset_from_seed(seed, self.k, self.degree_cdf)
+        subset = _subset_from_seed(
+            seed, self.k, self.degree_cdf, singleton_limit=self.k
+        )
 
         residual = payload_bits.copy()
         unknown = []
