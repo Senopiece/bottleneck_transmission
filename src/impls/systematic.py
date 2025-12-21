@@ -39,8 +39,39 @@ def _vector_to_int(bits: np.ndarray) -> int:
     return value
 
 
+def _int_to_bits_le(value: int, length: int) -> np.ndarray:
+    if length <= 0:
+        return np.zeros(0, dtype=np.uint8)
+    nbytes = (length + 7) // 8
+    raw = value.to_bytes(nbytes, "little", signed=False)
+    packed = np.frombuffer(raw, dtype=np.uint8)
+    bits = np.unpackbits(packed, bitorder="little")
+    return bits[:length]
+
+
 def _add_to_basis_rref_vector(v_bits: np.ndarray, basis: list[int]):
     v = _vector_to_int(v_bits)
+    for r in basis:
+        pivot = 1 << (r.bit_length() - 1)
+        if v & pivot:
+            v ^= r
+
+    if v == 0:
+        return False, basis
+
+    pivot = 1 << (v.bit_length() - 1)
+    new_basis = []
+    for r in basis:
+        if r & pivot:
+            r ^= v
+        new_basis.append(r)
+
+    new_basis.append(v)
+    new_basis.sort(reverse=True)
+    return True, new_basis
+
+
+def _add_to_basis_rref_int(v: int, basis: list[int]):
     for r in basis:
         pivot = 1 << (r.bit_length() - 1)
         if v & pivot:
@@ -117,6 +148,13 @@ def _monomial_masks(input_bits: int, rank: int) -> tuple[int, ...]:
     return tuple(masks)
 
 
+@lru_cache(maxsize=None)
+def _full_monomial_masks(input_bits: int) -> np.ndarray:
+    if input_bits < 0:
+        raise ValueError("input_bits must be >= 0")
+    return np.arange(1 << input_bits, dtype=np.uint64)
+
+
 def expand(x: np.ndarray, input_bits: int, rank: int) -> np.ndarray:
     x = np.array(x, dtype=np.uint8) & 1
     if x.size != input_bits:
@@ -134,6 +172,69 @@ def expand(x: np.ndarray, input_bits: int, rank: int) -> np.ndarray:
         out[idx] = 1 if (xmask & mask) == mask else 0
     out[-1] = 1
     return out
+
+
+def expand_full(x: np.ndarray, input_bits: int) -> np.ndarray:
+    x = np.array(x, dtype=np.uint8) & 1
+    if x.size != input_bits:
+        raise ValueError(f"Expected {input_bits} input bits, got {x.size}")
+
+    xmask = 0
+    for i, bit in enumerate(x):
+        xmask |= (int(bit) & 1) << i
+
+    masks = _full_monomial_masks(input_bits)
+    return ((masks & xmask) == masks).astype(np.uint8)
+
+
+def _g_seed(rank: int, input_bits: int) -> int:
+    return (rank << 32) ^ (input_bits << 16) ^ 0x9E3779B97F4A7C15
+
+
+@lru_cache(maxsize=None)
+def _deterministic_G(rank: int, input_bits: int) -> np.ndarray:
+    if rank < 0:
+        raise ValueError("rank must be >= 0")
+    m = 1 << input_bits
+    if rank == 0:
+        return np.zeros((0, m), dtype=np.uint8)
+    if m < rank:
+        raise ValueError("monomial count must be >= rank")
+
+    rng = random.Random(_g_seed(rank, input_bits))
+    rows: list[np.ndarray] = []
+    basis: list[int] = []
+    relax_after = max(64, rank * 64)
+    tries = 0
+    min_weight = m // 4 if m >= 16 else 1
+    max_weight = m - min_weight if m >= 16 else m
+
+    while len(rows) < rank:
+        row_int = rng.getrandbits(m)
+        if row_int == 0:
+            tries += 1
+            continue
+
+        if m >= 16 and tries < relax_after:
+            weight = row_int.bit_count()
+            if weight < min_weight or weight > max_weight:
+                tries += 1
+                continue
+
+        indep, basis = _add_to_basis_rref_int(row_int, basis)
+        if not indep:
+            tries += 1
+            continue
+
+        rows.append(_int_to_bits_le(row_int, m))
+        tries += 1
+
+    return np.stack(rows, axis=0).astype(np.uint8, copy=False)
+
+
+def _project_monomials(x: np.ndarray, input_bits: int, G: np.ndarray) -> np.ndarray:
+    monomials = expand_full(x, input_bits)
+    return (G @ monomials) % 2
 
 
 def _payload_to_matrix(
@@ -243,6 +344,7 @@ class SystematicProducer(Producer):
                 f"Cannot encode payload with {self.payload_bits} bits and packet size {n}"
             )
         self.rank, self.input_bits, self.output_bits, self.zero_pad = layout
+        self.G = _deterministic_G(self.rank, self.input_bits)
 
         payload = _int_to_bits(index, self.payload_bits)
         self.A = _payload_to_matrix(
@@ -267,7 +369,7 @@ class SystematicProducer(Producer):
                 dtype=np.uint8,
             )
 
-        fx = expand(x, self.input_bits, self.rank)
+        fx = _project_monomials(x, self.input_bits, self.G)
         y = (self.A @ fx) % 2
         if self.input_bits == 0:
             return y.astype(np.uint8)
@@ -291,6 +393,7 @@ class SystematicRecoverer(Recoverer):
                 f"Cannot recover payload with {self.payload_bits} bits and packet size {n}"
             )
         self.rank, self.input_bits, self.output_bits, self.zero_pad = layout
+        self.G = _deterministic_G(self.rank, self.input_bits)
 
         self.basis: list[int] = []
         self.x_cols: list[np.ndarray] = []
@@ -311,7 +414,7 @@ class SystematicRecoverer(Recoverer):
 
         x = packet[: self.input_bits]
         y = packet[self.input_bits :]
-        fx = expand(x, self.input_bits, self.rank)
+        fx = _project_monomials(x, self.input_bits, self.G)
 
         indep, new_basis = _add_to_basis_rref_vector(fx, self.basis)
         if not indep:
