@@ -185,6 +185,7 @@ def _select_layout(payload_bits: int, packet_bits: int):
     Note: we would need to collect rank linearly inpependent observations to recover the original data. So we need it to be as small as possible.
     Also lowering the rank increases output_bits that increases partitioning so the reconstruction becomes more parellelizable.
     TODO: maybe sometimes it can be beneficial of having not the minimum possible rank, but achieving better results somehow (usually when rank includes constant term of monomials it starts performing poorly) (e.g. for 10,5 to use (5, 3, 2, 0) instead of (4, 2, 3, 0) - so theoretically its having lower rank, but the second option has better resilience from errors).
+    TODO: maybe apply ml in search of optimal layouting
     """
 
     p = payload_bits
