@@ -5,11 +5,11 @@ from typing import Iterable
 
 import numpy as np
 
-from ._interface import Producer, Recoverer
+from ._interface import Config, Estimator, Packet, Payload, Protocol, Sampler
 
 
 # ---------------------------------------------------------------------------
-# Helper utilities shared by producer and recoverer
+# Helper utilities shared by sampler and estimator
 # ---------------------------------------------------------------------------
 
 
@@ -37,29 +37,6 @@ class _SchemeLayout:
     header_bits: int
     symbol_bits: int
     k: int
-
-
-def _payload_bits_for_d(d: int) -> int:
-    """Return how many bits are needed to encode ``d`` payload states."""
-    if d <= 1:
-        return 0
-    return math.ceil(math.log2(d))
-
-
-def _max_payload_bits_for_n(n: int) -> int:
-    """Best-case payload capacity (bits) for packets of width ``n``."""
-    if n <= 0:
-        return 0
-    best = 0
-    for header_bits in range(0, n):
-        symbol_bits = n - header_bits
-        if symbol_bits <= 0:
-            continue
-        k_max = max(1, 1 << header_bits)
-        capacity = k_max * symbol_bits
-        if capacity > best:
-            best = capacity
-    return best
 
 
 def _select_layout(n: int, payload_bits: int) -> _SchemeLayout:
@@ -158,58 +135,86 @@ def _subset_from_seed(
     return subset
 
 
-def _index_to_symbols(index: int, k: int, bits_per_symbol: int) -> np.ndarray:
-    """Convert payload index into ``k`` binary source blocks."""
-    if bits_per_symbol == 0:
+# ---------------------------------------------------------------------------
+# Payload helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_payload(payload: Payload, payload_bits: int) -> np.ndarray:
+    bits = np.array(payload, dtype=np.uint8).reshape(-1) & 1
+    if bits.size != payload_bits:
+        raise ValueError(
+            f"Expected payload of {payload_bits} bits, got {bits.size} bits"
+        )
+    return bits
+
+
+def _payload_bits_to_symbols(bits: np.ndarray, k: int, symbol_bits: int) -> np.ndarray:
+    """Map payload bits into ``k`` symbols, left-padding with zeros."""
+    if symbol_bits == 0:
         return np.zeros((k, 0), dtype=np.uint8)
-    total_bits = k * bits_per_symbol
-    if index < 0 or index >= 1 << total_bits:
-        raise ValueError(f"index={index} is out of range for {k} symbols")
-    flat_bits = _int_to_bits(index, total_bits)
-    return flat_bits.reshape((k, bits_per_symbol))
+
+    total_bits = k * symbol_bits
+    if bits.size > total_bits:
+        raise ValueError("payload exceeds available symbol capacity")
+
+    if bits.size == total_bits:
+        flat = bits
+    else:
+        flat = np.zeros(total_bits, dtype=np.uint8)
+        if bits.size:
+            flat[-bits.size :] = bits
+    return flat.reshape((k, symbol_bits))
 
 
-def _symbols_to_index(symbols: list[np.ndarray]) -> int:
-    """Flatten symbol list back into payload integer."""
+def _symbols_to_payload(symbols: list[np.ndarray], payload_bits: int) -> np.ndarray:
+    """Recover payload bits from flattened symbol list."""
+    if payload_bits == 0:
+        return np.zeros(0, dtype=np.bool_)
     if not symbols:
-        return 0
-    concatenated = np.concatenate(symbols) if symbols[0].size else np.zeros(0)
-    return _bits_to_int(concatenated.tolist())
+        raise ValueError("no symbols to reconstruct payload")
+
+    if symbols[0].size == 0:
+        return np.zeros(payload_bits, dtype=np.bool_)
+
+    flat = np.concatenate(symbols)
+    if flat.size < payload_bits:
+        raise ValueError("not enough symbol bits to recover payload")
+    return flat[-payload_bits:].astype(np.bool_, copy=False)
 
 
 # ---------------------------------------------------------------------------
-# Producer
+# Sampler
 # ---------------------------------------------------------------------------
 
 
-class LTProducer(Producer):
+class _LTSamplerState:
     """Classical LT fountain encoder with metadata headers sized per payload."""
 
-    def __init__(self, n: int, index: int, d: int):
-        if index < 0 or index >= d:
-            raise ValueError(f"index must be in [0, {d})")
-
-        self.n = n
-        self.d = d
-        self.payload_bits = _payload_bits_for_d(d)
-        max_payload_bits = _max_payload_bits_for_n(n)
-        if self.payload_bits > max_payload_bits:
-            raise ValueError(
-                f"Cannot encode {self.payload_bits} payload bits with n={n} (max {max_payload_bits})"
-            )
-
-        layout = _select_layout(n, self.payload_bits)
+    def __init__(
+        self,
+        packet_bits: int,
+        payload_bits: int,
+        payload: Payload,
+        layout: _SchemeLayout,
+    ):
+        self.n = packet_bits
+        self.payload_bits = payload_bits
         self.header_bits = layout.header_bits
         self.symbol_bits = layout.symbol_bits
         self.k = layout.k
 
         self.degree_cdf = _robust_soliton_cdf(self.k)
-        self.source_symbols = _index_to_symbols(index, self.k, self.symbol_bits)
+        payload_bits_arr = _normalize_payload(payload, payload_bits)
+        payload_seed = _bits_to_int(payload_bits_arr)
+        self.source_symbols = _payload_bits_to_symbols(
+            payload_bits_arr, self.k, self.symbol_bits
+        )
         self.seed_space = max(1, 1 << self.header_bits)
 
         seed_material = (
-            (index << 16)
-            ^ (n << 8)
+            (payload_seed << 16)
+            ^ (packet_bits << 8)
             ^ (self.k << 4)
             ^ (self.header_bits << 2)
             ^ 0xA5F152C3
@@ -224,7 +229,7 @@ class LTProducer(Producer):
             acc ^= self.source_symbols[idx]
         return acc
 
-    def generate(self) -> np.ndarray:
+    def generate(self) -> Packet:
         seed = self.rng.randrange(self.seed_space)
         header = _int_to_bits(seed, self.header_bits)
         subset = _subset_from_seed(
@@ -232,26 +237,25 @@ class LTProducer(Producer):
         )
         payload = self._xor_subset(subset)
         if self.header_bits == 0:
-            return payload.astype(np.uint8)
-        if self.symbol_bits == 0:
-            return header
-        return np.concatenate([header, payload]).astype(np.uint8)
+            packet = payload
+        elif self.symbol_bits == 0:
+            packet = header
+        else:
+            packet = np.concatenate([header, payload])
+        return packet.astype(np.bool_, copy=False)
 
 
 # ---------------------------------------------------------------------------
-# Recoverer
+# Estimator
 # ---------------------------------------------------------------------------
 
 
-class LTRecoverer(Recoverer):
+class _LTEstimatorState:
     """Peeling decoder for the LT stream."""
 
-    def __init__(self, n: int, d: int):
-        self.n = n
-        self.d = d
-        self.payload_bits = _payload_bits_for_d(d)
-
-        layout = _select_layout(n, self.payload_bits)
+    def __init__(self, packet_bits: int, payload_bits: int, layout: _SchemeLayout):
+        self.n = packet_bits
+        self.payload_bits = payload_bits
         self.header_bits = layout.header_bits
         self.symbol_bits = layout.symbol_bits
         self.k = layout.k
@@ -259,7 +263,9 @@ class LTRecoverer(Recoverer):
 
         self.symbols: list[np.ndarray | None] = [None for _ in range(self.k)]
         self.pending: list[tuple[set[int], np.ndarray]] = []
-        self.recovered_index: int | None = 0 if self.payload_bits == 0 else None
+        self.recovered_payload: np.ndarray | None = (
+            np.zeros(0, dtype=np.bool_) if self.payload_bits == 0 else None
+        )
 
     def _propagate_pending(self):
         if not self.pending:
@@ -295,34 +301,46 @@ class LTRecoverer(Recoverer):
 
             self.pending = new_pending
 
-    def _try_finalize(self) -> int | None:
-        if self.recovered_index is not None:
-            return self.recovered_index
-        if any(sym is None for sym in self.symbols):
-            return None
-        symbols = [self.symbols[i] for i in range(self.k)]
-        self.recovered_index = _symbols_to_index(symbols)
-        return self.recovered_index
+    def progress(self) -> float:
+        if self.recovered_payload is not None:
+            return 1.0
+        if self.k <= 0:
+            return 0.0
+        known = sum(1 for sym in self.symbols if sym is not None)
+        return min(1.0, known / self.k)
 
-    def feed(self, data: np.ndarray | None) -> int | None:
-        if self.recovered_index is not None:
-            return self.recovered_index
+    def _try_finalize(self) -> np.ndarray | None:
+        if self.recovered_payload is not None:
+            return self.recovered_payload
+        symbols: list[np.ndarray] = []
+        for sym in self.symbols:
+            if sym is None:
+                return None
+            symbols.append(sym)
+        self.recovered_payload = _symbols_to_payload(symbols, self.payload_bits)
+        return self.recovered_payload
+
+    def feed(self, data: Packet | None) -> Payload | None:
+        if self.recovered_payload is not None:
+            return self.recovered_payload
         if self.payload_bits == 0:
-            return self.recovered_index
+            self.recovered_payload = np.zeros(0, dtype=np.bool_)
+            return self.recovered_payload
         if data is None:
             return None
 
-        packet = np.array(data, dtype=np.uint8) & 1
-        assert packet.shape == (self.n,), "packet shape mismatch"
+        packet = np.array(data, dtype=np.uint8).reshape(-1) & 1
+        if packet.shape != (self.n,):
+            raise ValueError("packet shape mismatch")
 
         seed_bits = packet[: self.header_bits]
-        payload_bits = packet[self.header_bits :]
+        packet_payload = packet[self.header_bits :]
         seed = _bits_to_int(seed_bits.tolist())
         subset = _subset_from_seed(
             seed, self.k, self.degree_cdf, singleton_limit=self.k
         )
 
-        residual = payload_bits.copy()
+        residual = packet_payload.copy()
         unknown = []
         for idx in subset:
             sym = self.symbols[idx]
@@ -346,22 +364,45 @@ class LTRecoverer(Recoverer):
 
 
 # ---------------------------------------------------------------------------
-# Exported hooks for the benchmark harness
+# Protocol interface
 # ---------------------------------------------------------------------------
 
 
-def override_D(n: int) -> int:
-    max_bits = _max_payload_bits_for_n(n)
-    return 1 << max_bits if max_bits > 0 else 1
+def create_protocol(config: Config) -> Protocol:
+    packet_bits = int(config.packet_bitsize)
+    payload_bits = int(config.payload_bitsize)
+    if payload_bits < 0:
+        raise ValueError("payload_bitsize must be >= 0")
+
+    max_payload_bits = max_payload_bitsize(packet_bits)
+    if payload_bits > max_payload_bits:
+        raise ValueError(
+            f"Cannot encode {payload_bits} payload bits with packet size {packet_bits} "
+            f"(max {max_payload_bits})"
+        )
+
+    layout = _select_layout(packet_bits, payload_bits)
+
+    def make_sampler(payload: Payload) -> Sampler:
+        sampler_state = _LTSamplerState(packet_bits, payload_bits, payload, layout)
+        while True:
+            yield sampler_state.generate()
+
+    def make_estimator() -> Estimator:
+        estimator_state = _LTEstimatorState(packet_bits, payload_bits, layout)
+        packet = yield estimator_state.progress()
+        while True:
+            recovered = estimator_state.feed(packet)
+            if recovered is not None:
+                return recovered
+            packet = yield estimator_state.progress()
+
+    return Protocol(
+        make_sampler=make_sampler,
+        make_estimator=make_estimator,
+    )
 
 
-def producer_constructor(index: int, n: int, d: int) -> Producer:
-    if d > override_D(n):
-        raise ValueError(f"d={d} exceeds maximum supported payload for n={n}")
-    return LTProducer(n, index, d)
-
-
-def recoverer_constructor(n: int, d: int) -> Recoverer:
-    if d > override_D(n):
-        raise ValueError(f"d={d} exceeds maximum supported payload for n={n}")
-    return LTRecoverer(n, d)
+def max_payload_bitsize(packet_bitsize: int) -> int:
+    """Return the maximum payload size (in bits) for packets of the given size."""
+    return 2 ** (packet_bitsize - 1)

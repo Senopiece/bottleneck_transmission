@@ -1,37 +1,40 @@
-from abc import ABC, abstractmethod
+from typing import Callable, Generator, Iterator, NamedTuple
+from numpy.typing import NDArray
 import numpy as np
 
 
-class Producer:
-    @abstractmethod
-    def generate(self) -> np.ndarray:
-        """returns ndarray of shape (N,)"""
+BitArray = NDArray[np.bool_]
+
+Packet = BitArray
+Payload = BitArray
+
+Deletion = None  # send a special delimiter when deletion occurs
+
+Sampler = Iterator[Packet]  # yields Packets
+Estimator = Generator[
+    float, Packet | Deletion, Payload
+]  # receives Packets, yields % done [0-1], returns reconstructed Payload
 
 
-class GeneratorProducer(Producer):
-    """
-    Wrap any Python generator so it behaves like a Producer:
-        producer.generate() -> next value of the generator
-    """
-
-    def __init__(self, generator):
-        """
-        Parameters
-        ----------
-        generator : generator or iterable
-            A Python generator object or anything implementing __next__().
-        """
-        self._gen = generator
-
-    def generate(self):
-        """Return the next item from the wrapped generator."""
-        return next(self._gen)
+SamplerFactory = Callable[[Payload], Sampler]
+EstimatorFactory = Callable[[], Estimator]
 
 
-class Recoverer(ABC):
-    @abstractmethod
-    def feed(self, data: np.ndarray | None) -> int | None:
-        """
-        input: ndarray of shape (N,) or None for interrupt signal
-        output: recovered data: number from 0 to D-1 or None
-        """
+class Config(NamedTuple):
+    packet_bitsize: int
+    payload_bitsize: int
+
+
+class Protocol(NamedTuple):
+    make_sampler: SamplerFactory
+    make_estimator: EstimatorFactory
+
+
+ProtocolFactory = Callable[[Config], Protocol]
+
+# TODO: make a mermaid doc with explanation
+
+
+# Each impl is implementing:
+# max_payload_bitsize : int -> int # maximum payload size for a given packet size (all in bits)
+# create_protocol : ProtocolFactory

@@ -6,23 +6,7 @@ from itertools import combinations
 
 import numpy as np
 
-from ._interface import Producer, Recoverer
-
-
-def _payload_bits_for_d(d: int) -> int:
-    if d <= 1:
-        return 0
-    return (d - 1).bit_length()
-
-
-def _int_to_bits(value: int, length: int) -> np.ndarray:
-    if length <= 0:
-        return np.zeros(0, dtype=np.uint8)
-    bits = np.zeros(length, dtype=np.uint8)
-    for i in range(length):
-        shift = length - 1 - i
-        bits[i] = (value >> shift) & 1
-    return bits
+from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
 
 
 def _bits_to_int(bits) -> int:
@@ -116,19 +100,13 @@ def _invert_gf2(matrix: np.ndarray) -> np.ndarray | None:
     return aug[:, rows:]
 
 
-def _max_payload_bits_for_n(packet_bits: int) -> int:
-    if packet_bits <= 0:
-        return 0
-    best = 0
-    for input_bits in range(0, packet_bits):
-        output_bits = packet_bits - input_bits
-        if output_bits <= 0:
-            continue
-        max_rank = 1 << input_bits
-        capacity = max_rank * output_bits
-        if capacity > best:
-            best = capacity
-    return best
+def _normalize_payload(payload: Payload, payload_bits: int) -> np.ndarray:
+    bits = np.array(payload, dtype=np.uint8).reshape(-1) & 1
+    if bits.size != payload_bits:
+        raise ValueError(
+            f"Expected payload of {payload_bits} bits, got {bits.size} bits"
+        )
+    return bits
 
 
 @lru_cache(maxsize=None)
@@ -324,43 +302,35 @@ def _select_layout(payload_bits: int, packet_bits: int):
     return rank, input_bits, output_bits, zero_pad
 
 
-class SystematicProducer(Producer):
-    def __init__(self, n: int, index: int, d: int):
-        if index < 0 or index >= d:
-            raise ValueError(f"index must be in [0, {d})")
-
-        self.n = n
-        self.d = d
-        self.payload_bits = _payload_bits_for_d(d)
-        max_bits = _max_payload_bits_for_n(n)
-        if self.payload_bits > max_bits:
-            raise ValueError(
-                f"Cannot encode payload with {self.payload_bits} bits, max supported for n={n} is {max_bits}"
-            )
-
-        layout = _select_layout(self.payload_bits, n)
-        if layout is None:
-            raise ValueError(
-                f"Cannot encode payload with {self.payload_bits} bits and packet size {n}"
-            )
+class _SystematicSamplerState:
+    def __init__(
+        self,
+        packet_bits: int,
+        payload_bits: int,
+        payload: Payload,
+        layout: tuple[int, int, int, int],
+    ):
+        self.n = packet_bits
+        self.payload_bits = payload_bits
         self.rank, self.input_bits, self.output_bits, self.zero_pad = layout
         self.G = _deterministic_G(self.rank, self.input_bits)
 
-        payload = _int_to_bits(index, self.payload_bits)
+        payload_bits_arr = _normalize_payload(payload, payload_bits)
         self.A = _payload_to_matrix(
-            payload, self.output_bits, self.rank, self.zero_pad
+            payload_bits_arr, self.output_bits, self.rank, self.zero_pad
         ).astype(np.uint8)
 
+        payload_seed = _bits_to_int(payload_bits_arr)
         seed_material = (
-            (index << 24)
-            ^ (n << 16)
+            (payload_seed << 24)
+            ^ (packet_bits << 16)
             ^ (self.rank << 8)
             ^ (self.input_bits << 4)
             ^ 0x51D5A7
         )
         self.rng = random.Random(seed_material)
 
-    def generate(self) -> np.ndarray:
+    def generate(self) -> Packet:
         if self.input_bits == 0:
             x = np.zeros(0, dtype=np.uint8)
         else:
@@ -372,45 +342,50 @@ class SystematicProducer(Producer):
         fx = _project_monomials(x, self.input_bits, self.G)
         y = (self.A @ fx) % 2
         if self.input_bits == 0:
-            return y.astype(np.uint8)
-        return np.concatenate([x, y]).astype(np.uint8)
+            packet = y
+        else:
+            packet = np.concatenate([x, y])
+        return packet.astype(np.bool_, copy=False)
 
 
-class SystematicRecoverer(Recoverer):
-    def __init__(self, n: int, d: int):
-        self.n = n
-        self.d = d
-        self.payload_bits = _payload_bits_for_d(d)
-        max_bits = _max_payload_bits_for_n(n)
-        if self.payload_bits > max_bits:
-            raise ValueError(
-                f"Cannot recover payload with {self.payload_bits} bits, max supported for n={n} is {max_bits}"
-            )
-
-        layout = _select_layout(self.payload_bits, n)
-        if layout is None:
-            raise ValueError(
-                f"Cannot recover payload with {self.payload_bits} bits and packet size {n}"
-            )
+class _SystematicEstimatorState:
+    def __init__(
+        self,
+        packet_bits: int,
+        payload_bits: int,
+        layout: tuple[int, int, int, int],
+    ):
+        self.n = packet_bits
+        self.payload_bits = payload_bits
         self.rank, self.input_bits, self.output_bits, self.zero_pad = layout
         self.G = _deterministic_G(self.rank, self.input_bits)
 
         self.basis: list[int] = []
         self.x_cols: list[np.ndarray] = []
         self.y_cols: list[np.ndarray] = []
-        self.recovered_index: int | None = 0 if self.payload_bits == 0 else None
+        self.recovered_payload: np.ndarray | None = (
+            np.zeros(0, dtype=np.bool_) if self.payload_bits == 0 else None
+        )
 
-    def feed(self, data: np.ndarray | None) -> int | None:
-        if self.recovered_index is not None:
-            return self.recovered_index
+    def progress(self) -> float:
+        if self.recovered_payload is not None:
+            return 1.0
+        if self.rank <= 0:
+            return 0.0
+        return min(1.0, len(self.x_cols) / self.rank)
+
+    def feed(self, data: Packet | None) -> Payload | None:
+        if self.recovered_payload is not None:
+            return self.recovered_payload
         if self.payload_bits == 0:
-            self.recovered_index = 0
-            return self.recovered_index
+            self.recovered_payload = np.zeros(0, dtype=np.bool_)
+            return self.recovered_payload
         if data is None:
             return None
 
-        packet = np.array(data, dtype=np.uint8) & 1
-        assert packet.shape == (self.n,), "packet shape mismatch"
+        packet = np.array(data, dtype=np.uint8).reshape(-1) & 1
+        if packet.shape != (self.n,):
+            raise ValueError("packet shape mismatch")
 
         x = packet[: self.input_bits]
         y = packet[self.input_bits :]
@@ -434,18 +409,51 @@ class SystematicRecoverer(Recoverer):
 
         A = (Y @ Xinv) % 2
         payload = _matrix_to_payload(A, self.payload_bits, self.rank, self.output_bits)
-        self.recovered_index = _bits_to_int(payload)
-        return self.recovered_index
+        self.recovered_payload = payload.astype(np.bool_, copy=False)
+        return self.recovered_payload
 
 
-def override_D(n: int) -> int:
-    max_bits = _max_payload_bits_for_n(n)
-    return 1 << max_bits if max_bits > 0 else 1
+def create_protocol(config: Config) -> Protocol:
+    packet_bits = int(config.packet_bitsize)
+    payload_bits = int(config.payload_bitsize)
+    if payload_bits < 0:
+        raise ValueError("payload_bitsize must be >= 0")
+
+    max_bits = max_payload_bitsize(packet_bits)
+    if payload_bits > max_bits:
+        raise ValueError(
+            f"Cannot encode payload with {payload_bits} bits, max supported for "
+            f"packet size {packet_bits} is {max_bits}"
+        )
+
+    layout = _select_layout(payload_bits, packet_bits)
+    if layout is None:
+        raise ValueError(
+            f"Cannot encode payload with {payload_bits} bits and packet size {packet_bits}"
+        )
+
+    def make_sampler(payload: Payload) -> Sampler:
+        sampler_state = _SystematicSamplerState(
+            packet_bits, payload_bits, payload, layout
+        )
+        while True:
+            yield sampler_state.generate()
+
+    def make_estimator() -> Estimator:
+        estimator_state = _SystematicEstimatorState(packet_bits, payload_bits, layout)
+        packet = yield estimator_state.progress()
+        while True:
+            recovered = estimator_state.feed(packet)
+            if recovered is not None:
+                return recovered
+            packet = yield estimator_state.progress()
+
+    return Protocol(
+        make_sampler=make_sampler,
+        make_estimator=make_estimator,
+    )
 
 
-def producer_constructor(index: int, n: int, d: int) -> Producer:
-    return SystematicProducer(n, index, d)
-
-
-def recoverer_constructor(n: int, d: int) -> Recoverer:
-    return SystematicRecoverer(n, d)
+def max_payload_bitsize(packet_bitsize: int) -> int:
+    """Return the maximum payload size (in bits) for packets of the given size."""
+    return 2 ** (packet_bitsize - 1)
