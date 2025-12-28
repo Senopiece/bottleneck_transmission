@@ -32,9 +32,6 @@ class Protocol(NamedTuple):
 
 ProtocolFactory = Callable[[Config], Protocol]
 
-# TODO: make a mermaid doc with explanation
-
-
 # Each impl is implementing:
 # max_payload_bitsize : int -> int # maximum payload size for a given packet size (all in bits)
 # create_protocol : ProtocolFactory

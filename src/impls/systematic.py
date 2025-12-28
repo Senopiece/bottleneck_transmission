@@ -9,6 +9,12 @@ import numpy as np
 from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
 
 
+# Domain:
+# deletion_probability: [0, 1)
+# corruption_probability: 0
+# deletion_observation: 1
+
+
 def _bits_to_int(bits) -> int:
     value = 0
     for bit in bits:

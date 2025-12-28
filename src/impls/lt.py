@@ -8,6 +8,11 @@ import numpy as np
 from ._interface import Config, Estimator, Packet, Payload, Protocol, Sampler
 
 
+# Domain:
+# deletion_probability: [0, 1)
+# corruption_probability: 0
+# deletion_observation: 0
+
 # ---------------------------------------------------------------------------
 # Helper utilities shared by sampler and estimator
 # ---------------------------------------------------------------------------
