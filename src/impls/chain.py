@@ -12,6 +12,12 @@ from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
 # corruption_probability: 0
 # deletion_observation: 1
 
+# Plain monomials featurizer
+# NOTE: can be evolved in the way systematic is implemented: adding a fullrank shuffle, but even without shuffle appears to be not that bad. on the other hand can be evolved to use hash function instead of monomials + shuffle. each direction has its pros and cons, choose depending on your target packet size, payload size and computational/time resources:
+#   - monomials + shuffle: hard init, memory hungry (exponential to packet size, linear to payload size), hard compute, best theoretically possible recovery
+#   - just monomials: easy init (actully just efordless - no special init required), low memory, easy compute, good recovery
+#   - hash function: hard init, low memory, medium compute, best theoretically possible recovery
+
 # NOTE: Unlike traditional fountain codes this protocol requires deletion observation
 #        so its rateless but not fountain
 

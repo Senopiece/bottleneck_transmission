@@ -14,6 +14,8 @@ from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
 # corruption_probability: 0
 # deletion_observation: 1
 
+# Monomials + shuffle featurizer
+
 
 def _bits_to_int(bits) -> int:
     value = 0
