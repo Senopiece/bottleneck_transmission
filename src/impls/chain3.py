@@ -238,10 +238,11 @@ def _nonlinear_generator(n: int, m: int, seed: int, A: np.ndarray):
         yb = (A @ F) % 2
         return vec_to_int(yb)
 
+    L = min(3, int(0.626657 * 2 ** (n / 2) + 1))
     while True:
         curr = random.randint(1, (1 << n) - 1)
 
-        for _ in range(min(3, m + 2)):
+        for _ in range(L):
             yield int_to_vec(curr)
             curr = nonlinear_step(curr)
 
