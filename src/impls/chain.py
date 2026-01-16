@@ -87,6 +87,7 @@ def _invert_mod2(matrix: np.ndarray) -> np.ndarray | None:
                 aug[r] ^= aug[i]
     return aug[:, rows:]
 
+
 _MASK64 = (1 << 64) - 1
 _MIX64_CONST = 0x9E3779B97F4A7C15
 
@@ -250,6 +251,19 @@ def _nonlinear_generator(n: int, m: int, seed: int, A: np.ndarray):
     prev = 0
     curr = 1
 
+    def reset():
+        nonlocal prev, curr
+        prev = 0
+        tails_unvisited = set(tails) - visited
+        remaining = all_states - visited
+        curr = (
+            random.choice(list(tails_unvisited))
+            if tails_unvisited
+            else random.choice(list(remaining))
+        )
+
+    reset()
+
     while True:
         if curr in visited:
             if curr != 0 and prev != 0:
@@ -260,14 +274,7 @@ def _nonlinear_generator(n: int, m: int, seed: int, A: np.ndarray):
             if len(visited) == Nstates:
                 visited = {0}
 
-            prev = 0
-            tails_unvisited = set(tails) - visited
-            remaining = all_states - visited
-            curr = (
-                random.choice(list(tails_unvisited))
-                if tails_unvisited
-                else random.choice(list(remaining))
-            )
+            reset()
 
         yield int_to_vec(curr)
         visited.add(curr)
