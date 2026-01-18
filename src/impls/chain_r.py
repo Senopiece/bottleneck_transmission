@@ -2,23 +2,25 @@ from typing import Set, Tuple
 
 import random
 import numpy as np
-import numba as nb
 
-from ._conversions import (
+from ._utils.conversions import (
     bits_to_int,
     bool_array_to_uint16,
     int_to_bits,
     uint16_to_bool_array,
 )
-from ._gf import (
-    gf_matvec_right,
-    gf_solve_and_invert,
-    monomials_gf,
+from ._utils.gf2n import (
+    gf2n_matvec_right,
+    gf2n_solve_and_invert,
+    monomials_gf2n,
     step,
     primitive_poly_int,
 )
 from ._interface import Config, Protocol, Message, Sampler, Estimator
-from ._utils import floor_2n_log2_2n_minus_1, min_semisymbols_for_payload
+from ._utils.intmath import (
+    floor_2n_log2_2n_minus_1,
+    min_m_such_that_2n_minus_1_pow_k_ge_2p,
+)
 
 
 def _make_backbone_vector(int_msg: int, m: int, n: int) -> np.ndarray:
@@ -75,7 +77,7 @@ def create_protocol(config: Config) -> Protocol:
     # Precomputations
     # ==========================================================================
 
-    m = min_semisymbols_for_payload(
+    m = min_m_such_that_2n_minus_1_pow_k_ge_2p(
         message_bitsize,
         packet_bitsize,
         1 << packet_bitsize,
@@ -89,7 +91,7 @@ def create_protocol(config: Config) -> Protocol:
     # V = [h(1), h(2), ..., h(m)] stacked as columns, shape (m, m)
     V = np.empty((m, m), dtype=np.uint16)
     for i in range(1, m + 1):
-        V[:, i - 1] = monomials_gf(np.uint16(i), m, n, mask, red)
+        V[:, i - 1] = monomials_gf2n(np.uint16(i), m, n, mask, red)
 
     Vinv = None  # if a sender needs it, it can compute it
 
@@ -106,11 +108,11 @@ def create_protocol(config: Config) -> Protocol:
         # Convert backbone to generator coefficients vector
         if Vinv is None:
             # solve coeffs@V = backbone for coeffs
-            coeffs, Vinv, singular = gf_solve_and_invert(V, backbone, n, mask, red)
+            coeffs, Vinv, singular = gf2n_solve_and_invert(V, backbone, n, mask, red)
             assert not singular, "Undegeneracy matrix is singular!"
         else:
             # use cached inverse
-            coeffs = gf_matvec_right(backbone, Vinv, n, mask, red)
+            coeffs = gf2n_matvec_right(backbone, Vinv, n, mask, red)
 
         # Yield samples
         Nstates = 1 << n
@@ -180,17 +182,17 @@ def create_protocol(config: Config) -> Protocol:
         X = np.empty((m, m), dtype=np.uint16)
         Y = np.empty(m, dtype=np.uint16)
         for i, (x_val, y_val) in enumerate(evaluation_examples):
-            X[i, :] = monomials_gf(x_val, m, n, mask, red)
+            X[i, :] = monomials_gf2n(x_val, m, n, mask, red)
             Y[i] = y_val
 
         # solve Y = coeffs@X
-        coeffs, _, singular = gf_solve_and_invert(X, Y, n, mask, red)
+        coeffs, _, singular = gf2n_solve_and_invert(X, Y, n, mask, red)
         if singular:
             # This should not happen with correct protocol usage
             raise RuntimeError("Failed to reconstruct message: singular matrix.")
 
         # solve backbone = coeffs@V
-        backbone = gf_matvec_right(coeffs, V, n, mask, red)
+        backbone = gf2n_matvec_right(coeffs, V, n, mask, red)
         int_msg = _message_from_backbone_vector(backbone, n)
         message = int_to_bits(int_msg, message_bitsize)
 

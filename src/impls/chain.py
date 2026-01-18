@@ -2,8 +2,8 @@ import random
 
 import numpy as np
 
-from ._utils import floor_2n_log2_2n_minus_1
-from ._conversions import bits_to_int, int_to_bits
+from ._utils.intmath import floor_2n_log2_2n_minus_1
+from ._utils.conversions import bits_to_int, int_to_bits
 from ._interface import Estimator, Packet, Message, Protocol, Config, Sampler
 
 

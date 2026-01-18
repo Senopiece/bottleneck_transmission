@@ -7,6 +7,7 @@ import numpy as np
 
 from ._interface import Config, Estimator, Packet, Message, Protocol, Sampler
 
+# TODO: optimize computation with numba
 
 # Domain:
 # deletion_probability: [0, 1)
