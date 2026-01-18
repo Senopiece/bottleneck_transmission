@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 import random
 
 import numpy as np
 
-from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
+from ._utils import floor_2n_log2_2n_minus_1
+from ._conversions import bits_to_int, int_to_bits
+from ._interface import Estimator, Packet, Message, Protocol, Config, Sampler
 
 
 # Domain:
@@ -15,35 +15,22 @@ from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
 # NOTE: Unlike traditional fountain codes this protocol requires deletion observation
 #        so its rateless but not fountain
 
-
-def _bits_to_int(bits) -> int:
-    value = 0
-    for bit in bits:
-        value = (value << 1) | (int(bit) & 1)
-    return value
+# TODO: remove redundancies and optimize (numba)
+# TODO: extract reusable funcs
+# TODO: refactor to use pure generators
 
 
-def _int_to_bits(value: int, length: int) -> np.ndarray:
-    if length <= 0:
-        return np.zeros(0, dtype=np.uint8)
-    bits = np.zeros(length, dtype=np.uint8)
-    for i in range(length):
-        shift = length - 1 - i
-        bits[i] = (value >> shift) & 1
-    return bits
-
-
-def _normalize_payload(payload: Payload, payload_bits: int) -> np.ndarray:
+def _normalize_payload(payload: Message, message_bitsize: int) -> np.ndarray:
     bits = np.array(payload, dtype=np.uint8).reshape(-1) & 1
-    if bits.size != payload_bits:
+    if bits.size != message_bitsize:
         raise ValueError(
-            f"Expected payload of {payload_bits} bits, got {bits.size} bits"
+            f"Expected payload of {message_bitsize} bits, got {bits.size} bits"
         )
     return bits
 
 
 def _add_to_basis_rref_vector(v_bits: np.ndarray, basis: list[int]):
-    v = _bits_to_int(v_bits)
+    v = bits_to_int(v_bits)
     for r in basis:
         pivot = 1 << (r.bit_length() - 1)
         if v & pivot:
@@ -159,20 +146,14 @@ def _find_hash_seed_and_basis(n: int, m: int, max_tries: int = 4096):
     raise ValueError("Could not find hash seed with full-rank feature matrix")
 
 
-def _allowed_outputs_for_basis_state(x_int: int, n: int) -> list[int]:
-    return [v for v in range(1, 1 << n) if v != x_int]
-
-
 def _encode_payload_index_to_Y(index: int, n: int, m: int, x_basis: list[int]):
-    q = (1 << n) - 2
+    q = (1 << n) - 1
     cols = []
 
     for i in range(m):
-        allowed = _allowed_outputs_for_basis_state(x_basis[i], n)
-        d = index % q
+        d = (index % q) + 1
         index //= q
-        val = allowed[d]
-        col = np.array([(val >> (n - 1 - j)) & 1 for j in range(n)], dtype=np.uint8)
+        col = np.array([(d >> (n - 1 - j)) & 1 for j in range(n)], dtype=np.uint8)
         cols.append(col)
 
     return np.column_stack(cols)
@@ -181,42 +162,42 @@ def _encode_payload_index_to_Y(index: int, n: int, m: int, x_basis: list[int]):
 def _decode_Y_to_payload_index(
     Y: np.ndarray, n: int, m: int, x_basis: list[int]
 ) -> int:
-    q = (1 << n) - 2
+    q = (1 << n) - 1
     index = 0
     base = 1
 
     for i in range(m):
         col = Y[:, i]
-        val = 0
+        d = 0
         for b in col:
-            val = (val << 1) | int(b)
+            d = (d << 1) | int(b)
 
-        allowed = _allowed_outputs_for_basis_state(x_basis[i], n)
-        d = allowed.index(val)
         index += d * base
         base *= q
 
     return index
 
 
-def _infer_m_for_payload_bits(packet_bits: int, payload_bits: int) -> tuple[int, int]:
-    if payload_bits < 0:
-        raise ValueError("payload_bitsize must be >= 0")
+def _infer_m_for_message_bitsize(
+    packet_bitsize: int, message_bitsize: int
+) -> tuple[int, int]:
+    if message_bitsize < 0:
+        raise ValueError("message_bitsize must be >= 0")
 
-    q = (1 << packet_bits) - 2
+    q = (1 << packet_bitsize) - 1
     if q <= 0:
         raise ValueError("packet_bitsize must be >= 2 for chain")
 
-    target = 1 << payload_bits
+    target = 1 << message_bitsize
     capacity = 1
     m = 0
-    max_m = (1 << packet_bits) - 1
+    max_m = 1 << packet_bitsize
 
     while capacity < target:
         m += 1
         if m > max_m:
             raise ValueError(
-                "payload_bitsize exceeds chain capacity for the given packet_bitsize"
+                "message_bitsize exceeds chain capacity for the given packet_bitsize"
             )
         capacity *= q
 
@@ -239,12 +220,10 @@ def _nonlinear_generator(n: int, m: int, seed: int, A: np.ndarray):
         return vec_to_int(yb)
 
     Nstates = 1 << n
-    incoming_count = [0] * Nstates
+    tails = set(i for i in range(Nstates))
     for x in range(Nstates):
         y = nonlinear_step(x)
-        incoming_count[y] += 1
-
-    tails = [x for x in range(Nstates) if incoming_count[x] == 0]
+        tails.discard(y)
 
     visited = {0}
     all_states = set(range(Nstates))
@@ -269,7 +248,7 @@ def _nonlinear_generator(n: int, m: int, seed: int, A: np.ndarray):
             if curr != 0 and prev != 0:
                 yield int_to_vec(curr)
 
-            yield np.zeros(n, dtype=np.uint8)
+            yield np.zeros(n, dtype=np.bool_)
 
             if len(visited) == Nstates:
                 visited = {0}
@@ -285,42 +264,41 @@ def _nonlinear_generator(n: int, m: int, seed: int, A: np.ndarray):
 class _ChainSamplerState:
     def __init__(
         self,
-        packet_bits: int,
-        payload_bits: int,
-        payload: Payload,
+        packet_bitsize: int,
+        message_bitsize: int,
+        payload: Message,
         m: int,
         capacity: int,
         seed: int,
         x_basis: list[int],
         Xinv: np.ndarray,
     ):
-        self.n = packet_bits
-        payload_bits_arr = _normalize_payload(payload, payload_bits)
-        payload_index = _bits_to_int(payload_bits_arr)
+        self.n = packet_bitsize
+        message_bits_arr = _normalize_payload(payload, message_bitsize)
+        payload_index = bits_to_int(message_bits_arr)
         if payload_index >= capacity:
-            raise ValueError("payload_bitsize exceeds chain capacity")
+            raise ValueError("message_bitsize exceeds chain capacity")
 
         Y = _encode_payload_index_to_Y(payload_index, self.n, m, x_basis)
         A = (Y @ Xinv) % 2
         self._gen = _nonlinear_generator(self.n, m, seed, A)
 
     def generate(self) -> Packet:
-        packet = next(self._gen)
-        return packet.astype(np.bool_, copy=False)
+        return next(self._gen)
 
 
 class _ChainEstimatorState:
     def __init__(
         self,
-        packet_bits: int,
-        payload_bits: int,
+        packet_bitsize: int,
+        message_bitsize: int,
         m: int,
         seed: int,
         x_basis: list[int],
         X: np.ndarray,
     ):
-        self.n = packet_bits
-        self.payload_bits = payload_bits
+        self.n = packet_bitsize
+        self.message_bitsize = message_bitsize
         self.m = m
         self.seed = seed
         self.x_basis = x_basis
@@ -355,14 +333,14 @@ class _ChainEstimatorState:
         A = (Yobs @ Xinv) % 2
         Yrec = (A @ self.X) % 2
         payload_index = _decode_Y_to_payload_index(Yrec, self.n, self.m, self.x_basis)
-        payload_bits = _int_to_bits(payload_index, self.payload_bits)
-        self.recovered_payload = payload_bits.astype(np.bool_, copy=False)
+        message_bitsize = int_to_bits(payload_index, self.message_bitsize)
+        self.recovered_payload = message_bitsize.astype(np.bool_, copy=False)
         return self.recovered_payload
 
-    def feed(self, data: Packet | None) -> Payload | None:
+    def feed(self, data: Packet | None) -> Message | None:
         if self.recovered_payload is not None:
             return self.recovered_payload
-        if self.payload_bits == 0:
+        if self.message_bitsize == 0:
             self.recovered_payload = np.zeros(0, dtype=np.bool_)
             return self.recovered_payload
         if data is None:
@@ -381,7 +359,7 @@ class _ChainEstimatorState:
             key = (self.prev.tobytes(), packet.tobytes())
             if key not in self.transitions:
                 self.transitions.add(key)
-                x_int = _bits_to_int(self.prev)
+                x_int = bits_to_int(self.prev)
                 Fx = _hash_feature_vector(x_int, self.seed, self.m)
                 indep, new_basis = _add_to_basis_rref_vector(Fx, self.basis)
                 if indep:
@@ -395,22 +373,22 @@ class _ChainEstimatorState:
 
 
 def create_protocol(config: Config) -> Protocol:
-    packet_bits = int(config.packet_bitsize)
-    payload_bits = int(config.payload_bitsize)
-    if payload_bits < 0:
-        raise ValueError("payload_bitsize must be >= 0")
-    if packet_bits <= 0:
+    packet_bitsize = config.packet_bitsize
+    message_bitsize = config.message_bitsize
+    if message_bitsize < 0:
+        raise ValueError("message_bitsize must be >= 0")
+    if packet_bitsize <= 0:
         raise ValueError("packet_bitsize must be > 0")
-    if payload_bits == 0:
-        raise ValueError("payload_bitsize must be > 0")
+    if message_bitsize == 0:
+        raise ValueError("message_bitsize must be > 0")
 
-    m, capacity = _infer_m_for_payload_bits(packet_bits, payload_bits)
-    seed, x_basis, X, Xinv = _find_hash_seed_and_basis(packet_bits, m)
+    m, capacity = _infer_m_for_message_bitsize(packet_bitsize, message_bitsize)
+    seed, x_basis, X, Xinv = _find_hash_seed_and_basis(packet_bitsize, m)
 
-    def make_sampler(payload: Payload) -> Sampler:
+    def make_sampler(payload: Message) -> Sampler:
         sampler_state = _ChainSamplerState(
-            packet_bits,
-            payload_bits,
+            packet_bitsize,
+            message_bitsize,
             payload,
             m,
             capacity,
@@ -423,8 +401,8 @@ def create_protocol(config: Config) -> Protocol:
 
     def make_estimator() -> Estimator:
         estimator_state = _ChainEstimatorState(
-            packet_bits,
-            payload_bits,
+            packet_bitsize,
+            message_bitsize,
             m,
             seed,
             x_basis,
@@ -443,21 +421,5 @@ def create_protocol(config: Config) -> Protocol:
     )
 
 
-def max_payload_bitsize(packet_bitsize: int) -> int:
-    if packet_bitsize <= 0:
-        return 0
-
-    n = packet_bitsize
-    q = (1 << n) - 2
-    if q <= 0:
-        return 0
-
-    max_m = (1 << n) - 1
-    capacity = 1
-    m = 0
-
-    while m < max_m:
-        m += 1
-        capacity *= q
-
-    return capacity.bit_length() - 1
+def max_message_bitsize(packet_bitsize: int) -> int:
+    return floor_2n_log2_2n_minus_1(packet_bitsize) - 10

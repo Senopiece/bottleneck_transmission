@@ -5,7 +5,7 @@ from typing import Iterable
 
 import numpy as np
 
-from ._interface import Config, Estimator, Packet, Payload, Protocol, Sampler
+from ._interface import Config, Estimator, Packet, Message, Protocol, Sampler
 
 
 # Domain:
@@ -44,10 +44,10 @@ class _SchemeLayout:
     k: int
 
 
-def _select_layout(n: int, payload_bits: int) -> _SchemeLayout:
+def _select_layout(n: int, message_bitsize: int) -> _SchemeLayout:
     """
     Find the smallest header / source symbol configuration that can transfer
-    ``payload_bits`` bits over packets of length ``n``.
+    ``message_bitsize`` bits over packets of length ``n``.
     """
     if n <= 0:
         raise ValueError("Packet width n must be positive")
@@ -60,7 +60,9 @@ def _select_layout(n: int, payload_bits: int) -> _SchemeLayout:
         if symbol_bits <= 0:
             continue
 
-        k_required = 1 if payload_bits == 0 else math.ceil(payload_bits / symbol_bits)
+        k_required = (
+            1 if message_bitsize == 0 else math.ceil(message_bitsize / symbol_bits)
+        )
         seed_space = max(1, 1 << header_bits)
         if k_required > seed_space:
             continue
@@ -73,7 +75,7 @@ def _select_layout(n: int, payload_bits: int) -> _SchemeLayout:
 
     if best_layout is None:
         raise ValueError(
-            f"Cannot encode payload of {payload_bits} bits with packets of width {n}"
+            f"Cannot encode payload of {message_bitsize} bits with packets of width {n}"
         )
     return best_layout
 
@@ -141,20 +143,22 @@ def _subset_from_seed(
 
 
 # ---------------------------------------------------------------------------
-# Payload helpers
+# Message helpers
 # ---------------------------------------------------------------------------
 
 
-def _normalize_payload(payload: Payload, payload_bits: int) -> np.ndarray:
+def _normalize_payload(payload: Message, message_bitsize: int) -> np.ndarray:
     bits = np.array(payload, dtype=np.uint8).reshape(-1) & 1
-    if bits.size != payload_bits:
+    if bits.size != message_bitsize:
         raise ValueError(
-            f"Expected payload of {payload_bits} bits, got {bits.size} bits"
+            f"Expected payload of {message_bitsize} bits, got {bits.size} bits"
         )
     return bits
 
 
-def _payload_bits_to_symbols(bits: np.ndarray, k: int, symbol_bits: int) -> np.ndarray:
+def _message_bitsize_to_symbols(
+    bits: np.ndarray, k: int, symbol_bits: int
+) -> np.ndarray:
     """Map payload bits into ``k`` symbols, left-padding with zeros."""
     if symbol_bits == 0:
         return np.zeros((k, 0), dtype=np.uint8)
@@ -172,20 +176,20 @@ def _payload_bits_to_symbols(bits: np.ndarray, k: int, symbol_bits: int) -> np.n
     return flat.reshape((k, symbol_bits))
 
 
-def _symbols_to_payload(symbols: list[np.ndarray], payload_bits: int) -> np.ndarray:
+def _symbols_to_payload(symbols: list[np.ndarray], message_bitsize: int) -> np.ndarray:
     """Recover payload bits from flattened symbol list."""
-    if payload_bits == 0:
+    if message_bitsize == 0:
         return np.zeros(0, dtype=np.bool_)
     if not symbols:
         raise ValueError("no symbols to reconstruct payload")
 
     if symbols[0].size == 0:
-        return np.zeros(payload_bits, dtype=np.bool_)
+        return np.zeros(message_bitsize, dtype=np.bool_)
 
     flat = np.concatenate(symbols)
-    if flat.size < payload_bits:
+    if flat.size < message_bitsize:
         raise ValueError("not enough symbol bits to recover payload")
-    return flat[-payload_bits:].astype(np.bool_, copy=False)
+    return flat[-message_bitsize:].astype(np.bool_, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -198,28 +202,28 @@ class _LTSamplerState:
 
     def __init__(
         self,
-        packet_bits: int,
-        payload_bits: int,
-        payload: Payload,
+        packet_bitsize: int,
+        message_bitsize: int,
+        payload: Message,
         layout: _SchemeLayout,
     ):
-        self.n = packet_bits
-        self.payload_bits = payload_bits
+        self.n = packet_bitsize
+        self.message_bitsize = message_bitsize
         self.header_bits = layout.header_bits
         self.symbol_bits = layout.symbol_bits
         self.k = layout.k
 
         self.degree_cdf = _robust_soliton_cdf(self.k)
-        payload_bits_arr = _normalize_payload(payload, payload_bits)
-        payload_seed = _bits_to_int(payload_bits_arr)
-        self.source_symbols = _payload_bits_to_symbols(
-            payload_bits_arr, self.k, self.symbol_bits
+        message_bitsize_arr = _normalize_payload(payload, message_bitsize)
+        payload_seed = _bits_to_int(message_bitsize_arr)
+        self.source_symbols = _message_bitsize_to_symbols(
+            message_bitsize_arr, self.k, self.symbol_bits
         )
         self.seed_space = max(1, 1 << self.header_bits)
 
         seed_material = (
             (payload_seed << 16)
-            ^ (packet_bits << 8)
+            ^ (packet_bitsize << 8)
             ^ (self.k << 4)
             ^ (self.header_bits << 2)
             ^ 0xA5F152C3
@@ -258,9 +262,11 @@ class _LTSamplerState:
 class _LTEstimatorState:
     """Peeling decoder for the LT stream."""
 
-    def __init__(self, packet_bits: int, payload_bits: int, layout: _SchemeLayout):
-        self.n = packet_bits
-        self.payload_bits = payload_bits
+    def __init__(
+        self, packet_bitsize: int, message_bitsize: int, layout: _SchemeLayout
+    ):
+        self.n = packet_bitsize
+        self.message_bitsize = message_bitsize
         self.header_bits = layout.header_bits
         self.symbol_bits = layout.symbol_bits
         self.k = layout.k
@@ -269,7 +275,7 @@ class _LTEstimatorState:
         self.symbols: list[np.ndarray | None] = [None for _ in range(self.k)]
         self.pending: list[tuple[set[int], np.ndarray]] = []
         self.recovered_payload: np.ndarray | None = (
-            np.zeros(0, dtype=np.bool_) if self.payload_bits == 0 else None
+            np.zeros(0, dtype=np.bool_) if self.message_bitsize == 0 else None
         )
 
     def _propagate_pending(self):
@@ -322,13 +328,13 @@ class _LTEstimatorState:
             if sym is None:
                 return None
             symbols.append(sym)
-        self.recovered_payload = _symbols_to_payload(symbols, self.payload_bits)
+        self.recovered_payload = _symbols_to_payload(symbols, self.message_bitsize)
         return self.recovered_payload
 
-    def feed(self, data: Packet | None) -> Payload | None:
+    def feed(self, data: Packet | None) -> Message | None:
         if self.recovered_payload is not None:
             return self.recovered_payload
-        if self.payload_bits == 0:
+        if self.message_bitsize == 0:
             self.recovered_payload = np.zeros(0, dtype=np.bool_)
             return self.recovered_payload
         if data is None:
@@ -374,27 +380,29 @@ class _LTEstimatorState:
 
 
 def create_protocol(config: Config) -> Protocol:
-    packet_bits = int(config.packet_bitsize)
-    payload_bits = int(config.payload_bitsize)
-    if payload_bits < 0:
-        raise ValueError("payload_bitsize must be >= 0")
+    packet_bitsize = int(config.packet_bitsize)
+    message_bitsize = int(config.message_bitsize)
+    if message_bitsize < 0:
+        raise ValueError("message_bitsize must be >= 0")
 
-    max_payload_bits = max_payload_bitsize(packet_bits)
-    if payload_bits > max_payload_bits:
+    _max_message_bitsize = max_message_bitsize(packet_bitsize)
+    if message_bitsize > _max_message_bitsize:
         raise ValueError(
-            f"Cannot encode {payload_bits} payload bits with packet size {packet_bits} "
-            f"(max {max_payload_bits})"
+            f"Cannot encode {message_bitsize} payload bits with packet size {packet_bitsize} "
+            f"(max {_max_message_bitsize})"
         )
 
-    layout = _select_layout(packet_bits, payload_bits)
+    layout = _select_layout(packet_bitsize, message_bitsize)
 
-    def make_sampler(payload: Payload) -> Sampler:
-        sampler_state = _LTSamplerState(packet_bits, payload_bits, payload, layout)
+    def make_sampler(payload: Message) -> Sampler:
+        sampler_state = _LTSamplerState(
+            packet_bitsize, message_bitsize, payload, layout
+        )
         while True:
             yield sampler_state.generate()
 
     def make_estimator() -> Estimator:
-        estimator_state = _LTEstimatorState(packet_bits, payload_bits, layout)
+        estimator_state = _LTEstimatorState(packet_bitsize, message_bitsize, layout)
         packet = yield estimator_state.progress()
         while True:
             recovered = estimator_state.feed(packet)
@@ -408,6 +416,6 @@ def create_protocol(config: Config) -> Protocol:
     )
 
 
-def max_payload_bitsize(packet_bitsize: int) -> int:
+def max_message_bitsize(packet_bitsize: int) -> int:
     """Return the maximum payload size (in bits) for packets of the given size."""
     return 2 ** (packet_bitsize - 1)

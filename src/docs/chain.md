@@ -326,7 +326,7 @@ D = (2^n - 2)^m.
 
 ---
 
-# **11. Mapping Payload Index ↔ Matrix (A)**
+# **11. Mapping Message Index ↔ Matrix (A)**
 
 Given:
 
@@ -438,7 +438,7 @@ Thus recovery is **guaranteed**.
 
 # **15. Information-Theoretic Interpretation**
 
-Payload bits:
+Message bits:
 
 [
 B = m \log_2(2^n - 2) \approx m n.

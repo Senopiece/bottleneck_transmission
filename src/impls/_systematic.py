@@ -5,7 +5,7 @@ from functools import lru_cache
 
 import numpy as np
 
-from ._interface import Estimator, Packet, Payload, Protocol, Config, Sampler
+from ._interface import Estimator, Packet, Message, Protocol, Config, Sampler
 
 
 # Domain:
@@ -131,20 +131,20 @@ def _find_hash_seed(rank: int, input_bits: int, max_tries: int = 4096) -> int:
     raise ValueError("Could not find hash seed with full-rank feature matrix")
 
 
-def _normalize_payload(payload: Payload, payload_bits: int) -> np.ndarray:
+def _normalize_payload(payload: Message, message_bitsize: int) -> np.ndarray:
     bits = np.array(payload, dtype=np.uint8).reshape(-1) & 1
-    if bits.size != payload_bits:
+    if bits.size != message_bitsize:
         raise ValueError(
-            f"Expected payload of {payload_bits} bits, got {bits.size} bits"
+            f"Expected payload of {message_bitsize} bits, got {bits.size} bits"
         )
     return bits
 
 
 def _payload_to_matrix(
-    payload_bits: np.ndarray, output_bits: int, rank: int, zero_pad: int
+    message_bitsize: np.ndarray, output_bits: int, rank: int, zero_pad: int
 ) -> np.ndarray:
     capacity = output_bits * rank
-    bits = np.array(payload_bits, dtype=np.uint8) & 1
+    bits = np.array(message_bitsize, dtype=np.uint8) & 1
     if bits.size > capacity:
         raise ValueError("payload exceeds available capacity")
 
@@ -159,13 +159,13 @@ def _payload_to_matrix(
 
 
 def _matrix_to_payload(
-    matrix: np.ndarray, payload_bits: int, rank: int, output_bits: int
+    matrix: np.ndarray, message_bitsize: int, rank: int, output_bits: int
 ) -> np.ndarray:
-    if payload_bits <= 0:
+    if message_bitsize <= 0:
         return np.zeros(0, dtype=np.uint8)
     order = "F" if rank > output_bits else "C"
     flat = matrix.reshape(-1, order=order)
-    return flat[:payload_bits].copy()
+    return flat[:message_bitsize].copy()
 
 
 def _ceil_log2(x: int) -> int:
@@ -174,13 +174,13 @@ def _ceil_log2(x: int) -> int:
     return x.bit_length() - (1 if (x & (x - 1)) == 0 else 0)
 
 
-def _select_layout(payload_bits: int, packet_bits: int):
+def _select_layout(message_bitsize: int, packet_bitsize: int):
     """
-    Selects a optimal layout given payload_bits and packet_bits.
+    Selects a optimal layout given message_bitsize and packet_bitsize.
 
     Choose (rank, input_bits, output_bits, zero_pad) with:
-      - output_bits = packet_bits - input_bits > 0
-      - rank * output_bits >= payload_bits
+      - output_bits = packet_bitsize - input_bits > 0
+      - rank * output_bits >= message_bitsize
     Optimize lexicographically:
       1) rank (min)
       2) zero_pad (min)
@@ -192,8 +192,8 @@ def _select_layout(payload_bits: int, packet_bits: int):
     TODO: maybe apply ml in search of optimal layouting
     """
 
-    p = payload_bits
-    n = packet_bits
+    p = message_bitsize
+    n = packet_bitsize
 
     best = None  # (rank, zero_pad, input_bits, output_bits)
 
@@ -230,26 +230,26 @@ def _select_layout(payload_bits: int, packet_bits: int):
 class _SystematicSamplerState:
     def __init__(
         self,
-        packet_bits: int,
-        payload_bits: int,
-        payload: Payload,
+        packet_bitsize: int,
+        message_bitsize: int,
+        payload: Message,
         layout: tuple[int, int, int, int],
         seed: int,
     ):
-        self.n = packet_bits
-        self.payload_bits = payload_bits
+        self.n = packet_bitsize
+        self.message_bitsize = message_bitsize
         self.rank, self.input_bits, self.output_bits, self.zero_pad = layout
         self.seed = seed
 
-        payload_bits_arr = _normalize_payload(payload, payload_bits)
+        message_bitsize_arr = _normalize_payload(payload, message_bitsize)
         self.A = _payload_to_matrix(
-            payload_bits_arr, self.output_bits, self.rank, self.zero_pad
+            message_bitsize_arr, self.output_bits, self.rank, self.zero_pad
         ).astype(np.uint8)
 
-        payload_seed = _bits_to_int(payload_bits_arr)
+        payload_seed = _bits_to_int(message_bitsize_arr)
         seed_material = (
             (payload_seed << 24)
-            ^ (packet_bits << 16)
+            ^ (packet_bitsize << 16)
             ^ (self.rank << 8)
             ^ (self.input_bits << 4)
             ^ 0x51D5A7
@@ -277,13 +277,13 @@ class _SystematicSamplerState:
 class _SystematicEstimatorState:
     def __init__(
         self,
-        packet_bits: int,
-        payload_bits: int,
+        packet_bitsize: int,
+        message_bitsize: int,
         layout: tuple[int, int, int, int],
         seed: int,
     ):
-        self.n = packet_bits
-        self.payload_bits = payload_bits
+        self.n = packet_bitsize
+        self.message_bitsize = message_bitsize
         self.rank, self.input_bits, self.output_bits, self.zero_pad = layout
         self.seed = seed
 
@@ -291,7 +291,7 @@ class _SystematicEstimatorState:
         self.x_cols: list[np.ndarray] = []
         self.y_cols: list[np.ndarray] = []
         self.recovered_payload: np.ndarray | None = (
-            np.zeros(0, dtype=np.bool_) if self.payload_bits == 0 else None
+            np.zeros(0, dtype=np.bool_) if self.message_bitsize == 0 else None
         )
 
     def progress(self) -> float:
@@ -301,10 +301,10 @@ class _SystematicEstimatorState:
             return 0.0
         return min(1.0, len(self.x_cols) / self.rank)
 
-    def feed(self, data: Packet | None) -> Payload | None:
+    def feed(self, data: Packet | None) -> Message | None:
         if self.recovered_payload is not None:
             return self.recovered_payload
-        if self.payload_bits == 0:
+        if self.message_bitsize == 0:
             self.recovered_payload = np.zeros(0, dtype=np.bool_)
             return self.recovered_payload
         if data is None:
@@ -335,42 +335,44 @@ class _SystematicEstimatorState:
             return None
 
         A = (Y @ Xinv) % 2
-        payload = _matrix_to_payload(A, self.payload_bits, self.rank, self.output_bits)
+        payload = _matrix_to_payload(
+            A, self.message_bitsize, self.rank, self.output_bits
+        )
         self.recovered_payload = payload.astype(np.bool_, copy=False)
         return self.recovered_payload
 
 
 def create_protocol(config: Config) -> Protocol:
-    packet_bits = int(config.packet_bitsize)
-    payload_bits = int(config.payload_bitsize)
-    if payload_bits < 0:
-        raise ValueError("payload_bitsize must be >= 0")
+    packet_bitsize = int(config.packet_bitsize)
+    message_bitsize = int(config.message_bitsize)
+    if message_bitsize < 0:
+        raise ValueError("message_bitsize must be >= 0")
 
-    max_bits = max_payload_bitsize(packet_bits)
-    if payload_bits > max_bits:
+    max_bits = max_message_bitsize(packet_bitsize)
+    if message_bitsize > max_bits:
         raise ValueError(
-            f"Cannot encode payload with {payload_bits} bits, max supported for "
-            f"packet size {packet_bits} is {max_bits}"
+            f"Cannot encode payload with {message_bitsize} bits, max supported for "
+            f"packet size {packet_bitsize} is {max_bits}"
         )
 
-    layout = _select_layout(payload_bits, packet_bits)
+    layout = _select_layout(message_bitsize, packet_bitsize)
     if layout is None:
         raise ValueError(
-            f"Cannot encode payload with {payload_bits} bits and packet size {packet_bits}"
+            f"Cannot encode payload with {message_bitsize} bits and packet size {packet_bitsize}"
         )
     rank, input_bits, _, _ = layout
     seed = _find_hash_seed(rank, input_bits)
 
-    def make_sampler(payload: Payload) -> Sampler:
+    def make_sampler(payload: Message) -> Sampler:
         sampler_state = _SystematicSamplerState(
-            packet_bits, payload_bits, payload, layout, seed
+            packet_bitsize, message_bitsize, payload, layout, seed
         )
         while True:
             yield sampler_state.generate()
 
     def make_estimator() -> Estimator:
         estimator_state = _SystematicEstimatorState(
-            packet_bits, payload_bits, layout, seed
+            packet_bitsize, message_bitsize, layout, seed
         )
         packet = yield estimator_state.progress()
         while True:
@@ -385,6 +387,6 @@ def create_protocol(config: Config) -> Protocol:
     )
 
 
-def max_payload_bitsize(packet_bitsize: int) -> int:
+def max_message_bitsize(packet_bitsize: int) -> int:
     """Return the maximum payload size (in bits) for packets of the given size."""
     return 2 ** (packet_bitsize - 1)
