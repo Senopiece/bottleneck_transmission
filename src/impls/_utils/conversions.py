@@ -1,5 +1,9 @@
 import numpy as np
 
+## ======================================================================================
+## int <-> bits
+## ======================================================================================
+
 
 def bits_to_int(bits) -> int:
     value = 0
@@ -16,6 +20,11 @@ def int_to_bits(value: int, length: int) -> np.ndarray:
         shift = length - 1 - i
         bits[i] = (value >> shift) & 1
     return bits
+
+
+## ======================================================================================
+## uint <-> bool array
+## ======================================================================================
 
 
 def uint16_to_bool_array(x: np.uint16, n: int = 16) -> np.ndarray:
@@ -40,3 +49,95 @@ def bool_array_to_uint16(bits: np.ndarray) -> np.uint16:
     for b in bits:
         v = (v << 1) | int(b)
     return np.uint16(v)
+
+
+## ======================================================================================
+## Z Backbone vector work
+## ======================================================================================
+
+
+def make_zbackbone_vector(int_msg: int, m: int, n: int) -> np.ndarray:
+    """
+    Convert message index to backbone vector (vector with no zero components) in GF(2^n).
+
+    Args:
+        int_msg: integer in [0, q^m - 1], where q = 2^n - 1
+        m: number of semisymbols
+        n: packet bitsize
+    Returns:
+        Backbone vector as np.ndarray of shape (m,), dtype=np.uint16
+    """
+    q = 1 << n - 1
+    vec = np.empty(m, dtype=np.uint16)
+
+    for i in range(m):
+        d = (int_msg % q) + 1  # GF(2^n) elements indexed from 1
+        int_msg //= q
+        vec[i] = np.uint16(d)
+
+    return vec
+
+
+def message_from_zbackbone_vector(backbone: np.ndarray, n: int) -> int:
+    """
+    Convert backbone vector (vector with no zero components) in GF(2^n) to message index.
+
+    Args:
+        backbone: np.ndarray of shape (m,), dtype=np.uint16
+        n: packet bitsize
+    Returns:
+        Integer in [0, q^m - 1], where q = 2^n - 1
+    """
+    q = 1 << n - 1
+    int_msg = 0
+
+    for i in range(backbone.shape[0] - 1, -1, -1):
+        int_msg = int_msg * q + (int(backbone[i]) - 1)
+
+    return int_msg
+
+
+## ======================================================================================
+## Plain backbone vector work
+## ======================================================================================
+
+
+def make_backbone_vector(int_msg: int, m: int, n: int) -> np.ndarray:
+    """
+    Convert message index to backbone vector in GF(2^n - 1).
+
+    Args:
+        int_msg: integer in [0, q^m - 1], where q = 2^n - 1
+        m: number of semisymbols
+        n: packet bitsize
+    Returns:
+        Backbone vector as np.ndarray of shape (m,), dtype=np.uint16
+    """
+    q = 1 << n - 1
+    vec = np.empty(m, dtype=np.uint16)
+
+    for i in range(m):
+        d = int_msg % q  # GF(2^n - 1) elements
+        int_msg //= q
+        vec[i] = np.uint16(d)
+
+    return vec
+
+
+def message_from_backbone_vector(backbone: np.ndarray, n: int) -> int:
+    """
+    Convert backbone vector in GF(2^n - 1) to message index.
+
+    Args:
+        backbone: np.ndarray of shape (m,), dtype=np.uint16
+        n: packet bitsize
+    Returns:
+        Integer in [0, q^m - 1], where q = 2^n - 1
+    """
+    q = 1 << n - 1
+    int_msg = 0
+
+    for i in range(backbone.shape[0] - 1, -1, -1):
+        int_msg = int_msg * q + int(backbone[i])
+
+    return int_msg

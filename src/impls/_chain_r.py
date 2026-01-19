@@ -4,6 +4,8 @@ import random
 import numpy as np
 
 from ._utils.conversions import (
+    make_zbackbone_vector,
+    message_from_zbackbone_vector,
     bits_to_int,
     bool_array_to_uint16,
     int_to_bits,
@@ -22,46 +24,7 @@ from ._utils.intmath import (
     min_m_such_that_2n_minus_1_pow_k_ge_2p,
 )
 
-
-def _make_backbone_vector(int_msg: int, m: int, n: int) -> np.ndarray:
-    """
-    Convert message index to backbone vector (vector with no zero components) in GF(2^n).
-
-    Args:
-        int_msg: integer in [0, q^m - 1], where q = 2^n - 1
-        m: number of semisymbols
-        n: packet bitsize
-    Returns:
-        Backbone vector as np.ndarray of shape (m,), dtype=np.uint16
-    """
-    q = 1 << n - 1
-    vec = np.empty(m, dtype=np.uint16)
-
-    for i in range(m):
-        d = (int_msg % q) + 1  # GF(2^n) elements indexed from 1
-        int_msg //= q
-        vec[i] = np.uint16(d)
-
-    return vec
-
-
-def _message_from_backbone_vector(backbone: np.ndarray, n: int) -> int:
-    """
-    Convert backbone vector (vector with no zero components) in GF(2^n) to message index.
-
-    Args:
-        backbone: np.ndarray of shape (m,), dtype=np.uint16
-        n: packet bitsize
-    Returns:
-        Integer in [0, q^m - 1], where q = 2^n - 1
-    """
-    q = 1 << n - 1
-    int_msg = 0
-
-    for i in range(backbone.shape[0] - 1, -1, -1):
-        int_msg = int_msg * q + (int(backbone[i]) - 1)
-
-    return int_msg
+# TODO: fix, now not working
 
 
 def create_protocol(config: Config) -> Protocol:
@@ -103,7 +66,7 @@ def create_protocol(config: Config) -> Protocol:
 
         # Convert message to backbone vector
         int_msg = bits_to_int(message)
-        backbone = _make_backbone_vector(int_msg, m, n)  # shape (m,)
+        backbone = make_zbackbone_vector(int_msg, m, n)  # shape (m,)
 
         # Convert backbone to generator coefficients vector
         if Vinv is None:
@@ -193,7 +156,7 @@ def create_protocol(config: Config) -> Protocol:
 
         # solve backbone = coeffs@V
         backbone = gf2n_matvec_right(coeffs, V, n, mask, red)
-        int_msg = _message_from_backbone_vector(backbone, n)
+        int_msg = message_from_zbackbone_vector(backbone, n)
         message = int_to_bits(int_msg, message_bitsize)
 
         return message

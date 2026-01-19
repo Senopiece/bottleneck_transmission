@@ -1,6 +1,3 @@
-import math
-
-
 def min_m_such_that_2n_minus_1_pow_k_ge_2p(
     p: int,
     n: int,

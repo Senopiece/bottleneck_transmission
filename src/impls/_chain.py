@@ -6,6 +6,7 @@ from ._utils.intmath import floor_2n_log2_2n_minus_1
 from ._utils.conversions import bits_to_int, int_to_bits
 from ._interface import Estimator, Packet, Message, Protocol, Config, Sampler
 
+# TODO: fix, now not working
 
 # Domain:
 # deletion_probability: [0, 1)
