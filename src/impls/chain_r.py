@@ -24,6 +24,11 @@ from ._utils.intmath import (
     min_m_such_that_2n_minus_1_pow_k_ge_2p,
 )
 
+# Domain:
+# deletion_probability: [0, 1)
+# corruption_probability: 0
+# deletion_observation: 1.0
+
 
 def create_protocol(config: Config) -> Protocol:
     packet_bitsize = config.packet_bitsize

@@ -509,7 +509,7 @@ def berlekamp_welch(
     X = np.empty((m, m), dtype=np.uint16)
     Y = np.empty(m, dtype=np.uint16)
     for i in range(m):
-        X[i, :] = monomials_gf2n(xs[i], m, n, mask, red)
+        X[:, i] = monomials_gf2n(xs[i], m, n, mask, red)
         Y[i] = ys[i]
 
     coeffs, _, singular = gf2n_solve_and_invert(X, Y, n, mask, red)

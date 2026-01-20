@@ -8,6 +8,8 @@ import numpy as np
 from ._utils.algo import majority_vote
 from ._utils.conversions import (
     bool_array_to_uint16,
+    make_rbackbone_vector,
+    message_from_rbackbone_vector,
     uint16_to_bool_array,
 )
 from ._utils.gf2n import (
@@ -17,10 +19,14 @@ from ._utils.gf2n import (
 )
 from ._interface import Config, Protocol, Message, Sampler, Estimator
 
-# TODO: fix, now not working
+# NOTE: this is the first steps outta domain of full guarantee on correct recover, chasing faster convergence and further working on faulty channels
 
+# Domain:
+# deletion_probability: [0, 1)
+# corruption_probability: smth
+# deletion_observation: 1.0
 
-# NOTE: this is directing a new approach - it does not guarantee correct reconstruction 100% of the time, but just 99.9999...% of the time with hope to converge faster - also it is more suitable under the channel with errors
+# NOTE: this is directing a new approach - it does not guarantee correct reconstruction 100% of the time, but just some % of the time with hope to converge faster - also it is more suitable under the channel with errors
 
 
 def create_protocol(config: Config) -> Protocol:
@@ -46,24 +52,8 @@ def create_protocol(config: Config) -> Protocol:
     # Sampler fabric
     # ==========================================================================
     def make_sampler(message: Message) -> Sampler:
-        # message: np.ndarray[bool], shape (L,)
-        # n: bits per symbol
-        # m: number of symbols
-
-        L = message.size
-        assert L <= m * n
-
-        backbone = np.zeros(m, dtype=np.uint16)
-
-        bit_idx = 0
-        for i in range(m):
-            v = np.uint16(0)
-            for j in range(n):
-                v <<= 1
-                if bit_idx < L and message[bit_idx]:
-                    v |= 1
-                bit_idx += 1
-            backbone[i] = v
+        # there dont need to convert message to int intermediate since the avaliable alphabet is perfectly a power of two
+        backbone = make_rbackbone_vector(message, m, n)
 
         # coeffs is just a backbone
         coeffs = backbone
@@ -108,7 +98,8 @@ def create_protocol(config: Config) -> Protocol:
     # Estimator fabric
     # ==========================================================================
     def make_estimator() -> Estimator:
-        k = m + 4  # oversampling to correct for resets
+        # TODO: a proper way to choose the redundancy amount to add
+        k = m + 10  # oversampling to correct for resets
         ready_evaluation_examples = 0
         evaluation_examples: Dict[np.uint16, Dict[np.uint16, int]] = defaultdict(
             lambda: defaultdict(lambda: 0)
@@ -165,13 +156,7 @@ def create_protocol(config: Config) -> Protocol:
         backbone = coeffs
 
         # reverse the packing
-        message = np.empty(message_bitsize, dtype=np.bool_)
-        k = 0
-        for i in range(m):
-            v = backbone[i]
-            for j in range(n - 1, -1, -1):
-                message[k] = (v >> j) & 1
-                k += 1
+        message = message_from_rbackbone_vector(backbone, message_bitsize, m, n)
 
         return message
 
@@ -182,4 +167,4 @@ def create_protocol(config: Config) -> Protocol:
 
 
 def max_message_bitsize(packet_bitsize: int) -> int:
-    return packet_bitsize * (1 << packet_bitsize) - 10
+    return int(packet_bitsize * (1 << packet_bitsize) * 0.6)

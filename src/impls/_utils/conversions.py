@@ -141,3 +141,58 @@ def message_from_backbone_vector(backbone: np.ndarray, n: int) -> int:
         int_msg = int_msg * q + int(backbone[i])
 
     return int_msg
+
+
+## ======================================================================================
+## Raw backbone vector work
+## ======================================================================================
+
+
+def make_rbackbone_vector(message: np.ndarray, m: int, n: int) -> np.ndarray:
+    """
+    Convert message bits to backbone vector in GF(2^n).
+
+    Args:
+        message: bits
+        m: number of symbols
+        n: symbol bitsize
+    Returns:
+        Backbone vector as np.ndarray of shape (m,), dtype=np.uint16
+    """
+    L = message.size
+    assert L <= m * n
+
+    backbone = np.zeros(m, dtype=np.uint16)
+
+    bit_idx = 0
+    for i in range(m):
+        v = np.uint16(0)
+        for j in range(n):
+            v <<= 1
+            if bit_idx < L and message[bit_idx]:
+                v |= 1
+            bit_idx += 1
+        backbone[i] = v
+
+    return backbone
+
+
+def message_from_rbackbone_vector(
+    backbone: np.ndarray,
+    message_bitsize: int,
+    m: int,
+    n: int,
+):
+    message = np.empty(message_bitsize, dtype=np.bool_)
+    bit_idx = 0
+    for i in range(m):
+        v = backbone[i]
+        for j in range(n - 1, -1, -1):
+            if bit_idx >= message_bitsize:
+                break
+            message[bit_idx] = ((v >> j) & 1) != 0
+            bit_idx += 1
+        if bit_idx >= message_bitsize:
+            break
+
+    return message

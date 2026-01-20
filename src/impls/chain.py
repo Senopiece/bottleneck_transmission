@@ -173,7 +173,7 @@ def _decode_Y_to_payload_index(
         for b in col:
             d = (d << 1) | int(b)
 
-        index += d * base
+        index += (d - 1) * base
         base *= q
 
     return index
