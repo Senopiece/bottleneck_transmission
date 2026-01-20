@@ -65,7 +65,7 @@ def monomials_gf2n_1(
 ):
     """
     m = number of monomials to compute.
-    out[i] = x^i in Z/(2^n - 1)Z
+    out[i] = x^i
     """
     acc = np.uint16(1)
 

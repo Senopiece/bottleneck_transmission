@@ -4,36 +4,54 @@ import random
 import numpy as np
 
 from ._utils.conversions import (
-    make_zbackbone_vector,
-    message_from_zbackbone_vector,
+    make_backbone_vector,
+    message_from_backbone_vector,
     bits_to_int,
     bool_array_to_uint16,
     int_to_bits,
     uint16_to_bool_array,
 )
-from ._utils.gf2n import (
-    gf2n_matvec_right,
-    gf2n_solve_and_invert,
-    monomials_gf2n,
+from ._utils.gf2n_1 import (
+    gf2n_1_solve_and_invert,
+    monomials_gf2n_1,
     step,
-    primitive_poly_int,
 )
 from ._interface import Config, Protocol, Message, Sampler, Estimator
 from ._utils.intmath import (
     floor_2n_log2_2n_minus_1,
+    ispowprime_1_15,
     min_m_such_that_2n_minus_1_pow_k_ge_2p,
 )
 
-# TODO: fix, now not working
+# Domain:
+# deletion_probability: [0, 1)
+# corruption_probability: 0
+# deletion_observation: 1.0
+
+# TODO: try to generalize this method onto ispowprime_1_15=False cases - by using just Z/(2^n - 1)Z ring
+#       the only problem is solving linear equations in that ring - which is not always possible
+#       because of two reasons:
+#       1) zero divisors during elimination
+#       2) Vandermonde matrix determinant is not guaranteed to be nonzero
+#
+#       - but there are still matrices that are invertible even in that ring
+#       so we just loose these two guarantees and need to write a more general solver that works in Z/(2^n - 1)Z
+#
+#       this can be done by collecting a wide X of shape mxk, k>=m, then for all possible m columns from this X, collect a X' that is a mxm matrix, check is it ivertible (e.g. hope while inverting X no zero divisors appear and the detetminant is not zero). if no invertible mxm submatrix found, we can just ask for more samples to make next k > prev k, then try again. seems like it is guaranteed to invert eventually (TODO: verify it). next TODO: every time taking more and more subsets is costly, so further come up with some faster algo that is euivalent to that but reuses computation.
+# TODO: also generalization can be achieved by decomposition of the 2^n - 1 into prime factors, then running distinct protocols in parallel. powers of primes to be handled with polynomial expansion like in gf2n case, distinct primes send and receive in parallel / as mixed field linear system. but this is more complex and probably not worth the effort. - so it also lets us leave in GF(2^n - 1), but with costly preparations and field ops and much more checks in the code - so slower code.
 
 
 def create_protocol(config: Config) -> Protocol:
     packet_bitsize = config.packet_bitsize
     message_bitsize = config.message_bitsize
 
-    if not (1 <= packet_bitsize <= 16):
+    if not (1 <= packet_bitsize <= 15):
         raise ValueError(
-            "GF(2^packet_bitsize) polynomial book integrated only for packet_bitsize in [1,16]."
+            "current implementation only supports packet_bitsize in [1, 15]"
+        )  # due to np.uint16 usage
+    if ispowprime_1_15(packet_bitsize) is False:
+        raise ValueError(
+            "packet_bitsize must be such that 2^n - 1 is prime for this protocol"
         )
 
     # ==========================================================================
@@ -47,51 +65,32 @@ def create_protocol(config: Config) -> Protocol:
     )
 
     n = packet_bitsize
-    poly = np.uint16(primitive_poly_int(n))  # includes x^n term
     mask = np.uint16((1 << n) - 1)  # keep n bits
-    red = np.uint16(poly & mask)  # poly without x^n term (low n bits)
-
-    # V = [h(1), h(2), ..., h(m)] stacked as columns, shape (m, m)
-    V = np.empty((m, m), dtype=np.uint16)
-    for i in range(1, m + 1):
-        V[:, i - 1] = monomials_gf2n(np.uint16(i), m, n, mask, red)
-
-    Vinv = None  # if a sender needs it, it can compute it
 
     # ==========================================================================
     # Sampler fabric
     # ==========================================================================
     def make_sampler(message: Message) -> Sampler:
-        nonlocal Vinv
-
         # Convert message to backbone vector
         int_msg = bits_to_int(message)
-        backbone = make_zbackbone_vector(int_msg, m, n)  # shape (m,)
+        backbone = make_backbone_vector(int_msg, m, n)  # shape (m,)
 
         # Convert backbone to generator coefficients vector
-        if Vinv is None:
-            # solve coeffs@V = backbone for coeffs
-            coeffs, Vinv, singular = gf2n_solve_and_invert(V, backbone, n, mask, red)
-            assert not singular, "Undegeneracy matrix is singular!"
-        else:
-            # use cached inverse
-            coeffs = gf2n_matvec_right(backbone, Vinv, n, mask, red)
+        coeffs = backbone  # ya, its simply that
 
         # Yield samples
-        Nstates = 1 << n
-        tails = set(np.uint16(i) for i in range(1, Nstates))
-        for x in range(1, Nstates):
-            y = step(np.uint16(x), coeffs, m, n, mask, red)
+        Nstates = (1 << n) - 1  # GF(2^n - 1) states
+        tails = set(np.uint16(i) for i in range(Nstates))
+        for x in range(Nstates):
+            y = step(np.uint16(x), coeffs, m, n, mask)
             tails.discard(y)
 
-        visited = {np.uint16(0)}
+        visited: Set[np.uint16] = set()
         all_states = set(np.uint16(i) for i in range(Nstates))
-        prev = np.uint16(0)
-        curr = np.uint16(1)
+        curr: np.uint16 = np.uint16(1)
 
         def reset():
-            nonlocal prev, curr
-            prev = np.uint16(0)
+            nonlocal curr
             tails_unvisited = set(tails) - visited
             remaining = all_states - visited
             curr = (
@@ -104,20 +103,17 @@ def create_protocol(config: Config) -> Protocol:
 
         while True:
             if curr in visited:
-                if curr != 0 and prev != 0:
-                    yield uint16_to_bool_array(curr, n)
-
+                yield uint16_to_bool_array(curr + 1, n)
                 yield np.zeros(n, dtype=np.bool_)
 
                 if len(visited) == Nstates:
-                    visited = {np.uint16(0)}
+                    visited.clear()
 
                 reset()
 
-            yield uint16_to_bool_array(curr, n)
+            yield uint16_to_bool_array(curr + 1, n)
             visited.add(curr)
-            prev = curr
-            curr = step(curr, coeffs, m, n, mask, red)
+            curr = step(curr, coeffs, m, n, mask)
 
     # ==========================================================================
     # Estimator fabric
@@ -136,7 +132,7 @@ def create_protocol(config: Config) -> Protocol:
                 continue
 
             # record example
-            y = bool_array_to_uint16(packet)
+            y = bool_array_to_uint16(packet) - 1
             if x is not None:
                 evaluation_examples.add((x, y))
             x = y
@@ -145,18 +141,18 @@ def create_protocol(config: Config) -> Protocol:
         X = np.empty((m, m), dtype=np.uint16)
         Y = np.empty(m, dtype=np.uint16)
         for i, (x_val, y_val) in enumerate(evaluation_examples):
-            X[i, :] = monomials_gf2n(x_val, m, n, mask, red)
+            X[:, i] = monomials_gf2n_1(x_val, m, n, mask)
             Y[i] = y_val
 
         # solve Y = coeffs@X
-        coeffs, _, singular = gf2n_solve_and_invert(X, Y, n, mask, red)
+        coeffs, _, singular = gf2n_1_solve_and_invert(X, Y, n, mask)
         if singular:
             # This should not happen with correct protocol usage
             raise RuntimeError("Failed to reconstruct message: singular matrix.")
 
-        # solve backbone = coeffs@V
-        backbone = gf2n_matvec_right(coeffs, V, n, mask, red)
-        int_msg = message_from_zbackbone_vector(backbone, n)
+        # backbone = coeffs
+        backbone = coeffs
+        int_msg = message_from_backbone_vector(backbone, n)
         message = int_to_bits(int_msg, message_bitsize)
 
         return message
@@ -168,4 +164,6 @@ def create_protocol(config: Config) -> Protocol:
 
 
 def max_message_bitsize(packet_bitsize: int) -> int:
-    return floor_2n_log2_2n_minus_1(packet_bitsize) - 10
+    if ispowprime_1_15(packet_bitsize):
+        return floor_2n_log2_2n_minus_1(packet_bitsize) - 10
+    return 0

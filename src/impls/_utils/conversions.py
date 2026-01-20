@@ -14,8 +14,8 @@ def bits_to_int(bits) -> int:
 
 def int_to_bits(value: int, length: int) -> np.ndarray:
     if length <= 0:
-        return np.zeros(0, dtype=np.uint8)
-    bits = np.zeros(length, dtype=np.uint8)
+        return np.zeros(0, dtype=np.bool_)
+    bits = np.empty(length, dtype=np.bool_)
     for i in range(length):
         shift = length - 1 - i
         bits[i] = (value >> shift) & 1
@@ -67,7 +67,7 @@ def make_zbackbone_vector(int_msg: int, m: int, n: int) -> np.ndarray:
     Returns:
         Backbone vector as np.ndarray of shape (m,), dtype=np.uint16
     """
-    q = 1 << n - 1
+    q = (1 << n) - 1
     vec = np.empty(m, dtype=np.uint16)
 
     for i in range(m):
@@ -88,7 +88,7 @@ def message_from_zbackbone_vector(backbone: np.ndarray, n: int) -> int:
     Returns:
         Integer in [0, q^m - 1], where q = 2^n - 1
     """
-    q = 1 << n - 1
+    q = (1 << n) - 1
     int_msg = 0
 
     for i in range(backbone.shape[0] - 1, -1, -1):
@@ -113,7 +113,7 @@ def make_backbone_vector(int_msg: int, m: int, n: int) -> np.ndarray:
     Returns:
         Backbone vector as np.ndarray of shape (m,), dtype=np.uint16
     """
-    q = 1 << n - 1
+    q = (1 << n) - 1
     vec = np.empty(m, dtype=np.uint16)
 
     for i in range(m):
@@ -134,7 +134,7 @@ def message_from_backbone_vector(backbone: np.ndarray, n: int) -> int:
     Returns:
         Integer in [0, q^m - 1], where q = 2^n - 1
     """
-    q = 1 << n - 1
+    q = (1 << n) - 1
     int_msg = 0
 
     for i in range(backbone.shape[0] - 1, -1, -1):
