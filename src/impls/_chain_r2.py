@@ -20,6 +20,9 @@ from ._interface import Config, Protocol, Message, Sampler, Estimator
 # TODO: fix, now not working
 
 
+# NOTE: this is directing a new approach - it does not guarantee correct reconstruction 100% of the time, but just 99.9999...% of the time with hope to converge faster - also it is more suitable under the channel with errors
+
+
 def create_protocol(config: Config) -> Protocol:
     packet_bitsize = config.packet_bitsize
     message_bitsize = config.message_bitsize
