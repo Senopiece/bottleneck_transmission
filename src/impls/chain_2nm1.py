@@ -1,3 +1,4 @@
+import math
 from typing import Set, Tuple
 
 import numpy as np
@@ -127,3 +128,91 @@ def max_message_bitsize(packet_bitsize: int) -> int:
     if ispowprime_1_15(packet_bitsize):
         return floor_2n_m1_log2_2n_m1(packet_bitsize)
     return 0
+
+
+# this is tight until m becomes too large such that the problem becomes closer to coupon collector
+def estimate_packets_until_reconstructed(
+    deletion_prob: float,
+    packet_bitsize: int,
+    message_bitsize: int,
+) -> float:
+    """
+    Estimate E[number of transmitted packets until reconstruction]
+    for the given protocol under independent deletions.
+
+    Assumptions:
+      - i.i.d. deletion channel with probability `deletion_prob`
+      - sampler delimiter process approximated as a renewal process
+        induced by a random functional graph on GF(2^N - 1)
+      - duplicates among early (x,y) pairs are negligible up to m samples
+
+    Parameters
+    ----------
+    deletion_prob : float
+        Packet deletion probability d, 0 <= d < 1.
+    packet_bitsize : int
+        N, packet size in bits.
+    message_bitsize : int
+        Payload size in bits.
+
+    Returns
+    -------
+    float
+        Expected number of transmitted packets until message reconstruction.
+    """
+
+    if not (0.0 <= deletion_prob < 1.0):
+        raise ValueError("deletion_prob must be in [0,1).")
+
+    # ------------------------------------------------------------------
+    # Step 1: interpolation sample requirement (from your protocol)
+    # ------------------------------------------------------------------
+    q = (1 << packet_bitsize) - 1  # number of GF states
+
+    m = min_m_such_that_2n_minus_1_pow_k_ge_2p(
+        message_bitsize,
+        packet_bitsize,
+        q,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: sampler-induced delimiter statistics
+    # ------------------------------------------------------------------
+    # Random-mapping approximation:
+    #   expected number of restart events per full traversal:
+    #       L ≈ q / e
+    #
+    # delimiter fraction:
+    #   λ = L / (q + 2L) = 1 / (e + 2)
+    #
+    # fraction of consecutive transmissions that are both data:
+    #   s = 1 - 2λ = e / (e + 2)
+
+    lambda_delim = 1.0 / (math.e + 2.0)
+    s = 1.0 - 2.0 * lambda_delim
+
+    # ------------------------------------------------------------------
+    # Step 3: channel + sampler probabilities
+    # ------------------------------------------------------------------
+    d = deletion_prob
+
+    # Probability a single transmission yields a received data packet
+    P1 = (1.0 - lambda_delim) * (1.0 - d)
+
+    # Probability two consecutive transmissions yield two received data packets
+    P2 = s * (1.0 - d) ** 2
+
+    if P2 <= 0.0:
+        return math.inf
+
+    # ------------------------------------------------------------------
+    # Step 4: expected time to collect m adjacent received pairs
+    # ------------------------------------------------------------------
+    # Exact expectation for "need m adjacent successes"
+    #
+    #   E[T] = m / P2 + (1 - P1) / (P1 - P2)
+
+    overhead = (1.0 - P1) / (P1 - P2)
+    expected_packets = m / P2 + overhead
+
+    return expected_packets

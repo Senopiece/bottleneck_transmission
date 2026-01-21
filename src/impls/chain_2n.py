@@ -147,3 +147,9 @@ def create_protocol(config: Config) -> Protocol:
 
 def max_message_bitsize(packet_bitsize: int) -> int:
     return floor_2n_m1_log2_2n_m1(packet_bitsize)
+
+
+def estimate_packets_until_reconstructed(
+    deletion_prob: float, packet_bitsize: int, message_bitsize: int
+):
+    return None
