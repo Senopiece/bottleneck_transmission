@@ -130,11 +130,8 @@ def max_message_bitsize(packet_bitsize: int) -> int:
     return 0
 
 
-# this is tight until m becomes too large such that the problem becomes closer to coupon collector
 def estimate_packets_until_reconstructed(
-    deletion_prob: float,
-    packet_bitsize: int,
-    message_bitsize: int,
+    deletion_prob: float, packet_bitsize: int, message_bitsize: int
 ) -> float:
     """
     Estimate E[number of transmitted packets until reconstruction]
@@ -145,6 +142,10 @@ def estimate_packets_until_reconstructed(
       - sampler delimiter process approximated as a renewal process
         induced by a random functional graph on GF(2^N - 1)
       - duplicates among early (x,y) pairs are negligible up to m samples
+
+    its tight for up to some inflection message_bitsize, after that coupon collector regime kicks in
+    the more faulty channel is, the lower this inflection message_bitsize
+    as we consider a low faulty channel, this becomes a tight estimate overall
 
     Parameters
     ----------
@@ -160,24 +161,31 @@ def estimate_packets_until_reconstructed(
     float
         Expected number of transmitted packets until message reconstruction.
     """
-
     if not (0.0 <= deletion_prob < 1.0):
         raise ValueError("deletion_prob must be in [0,1).")
+    if packet_bitsize < 1:
+        raise ValueError("packet_bitsize must be >= 1")
+    if message_bitsize <= 0:
+        return 0.0
 
-    # ------------------------------------------------------------------
-    # Step 1: interpolation sample requirement (from your protocol)
-    # ------------------------------------------------------------------
-    q = (1 << packet_bitsize) - 1  # number of GF states
+    n = packet_bitsize
+    w = message_bitsize
 
-    m = min_m_such_that_2n_minus_1_pow_k_ge_2p(
-        message_bitsize,
-        packet_bitsize,
-        q,
-    )
+    # Same m as the protocol uses, but smooth one
+    #
+    # 2^w = (2^n - 1)^m
+    # w = mlog2(2^n - 1)
+    # m = w / log2(2^n - 1)
 
-    # ------------------------------------------------------------------
-    # Step 2: sampler-induced delimiter statistics
-    # ------------------------------------------------------------------
+    q = (1 << n) - 1  # 2^n - 1
+    b = math.log(q, 2)
+    m = w / b
+
+    if m > q:
+        return math.inf
+
+    # Sampler-induced delimiter statistics
+    #
     # Random-mapping approximation:
     #   expected number of restart events per full traversal:
     #       L ≈ q / e
@@ -187,32 +195,23 @@ def estimate_packets_until_reconstructed(
     #
     # fraction of consecutive transmissions that are both data:
     #   s = 1 - 2λ = e / (e + 2)
-
     lambda_delim = 1.0 / (math.e + 2.0)
-    s = 1.0 - 2.0 * lambda_delim
+    s_data_adj = 1.0 - 2.0 * lambda_delim
 
-    # ------------------------------------------------------------------
-    # Step 3: channel + sampler probabilities
-    # ------------------------------------------------------------------
+    # Channel + sampler
     d = deletion_prob
+    P1 = (1.0 - lambda_delim) * (
+        1.0 - d
+    )  # probability a single transmission yields a received data packet
+    P2 = (
+        s_data_adj * (1.0 - d) ** 2
+    )  # probability two consecutive transmissions yield two received data packets
 
-    # Probability a single transmission yields a received data packet
-    P1 = (1.0 - lambda_delim) * (1.0 - d)
-
-    # Probability two consecutive transmissions yield two received data packets
-    P2 = s * (1.0 - d) ** 2
-
-    if P2 <= 0.0:
+    if P2 <= 0.0 or P1 <= 0.0 or P1 <= P2:
         return math.inf
 
-    # ------------------------------------------------------------------
-    # Step 4: expected time to collect m adjacent received pairs
-    # ------------------------------------------------------------------
     # Exact expectation for "need m adjacent successes"
     #
     #   E[T] = m / P2 + (1 - P1) / (P1 - P2)
-
     overhead = (1.0 - P1) / (P1 - P2)
-    expected_packets = m / P2 + overhead
-
-    return expected_packets
+    return m / P2 + overhead
