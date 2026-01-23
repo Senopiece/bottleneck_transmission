@@ -1,7 +1,7 @@
 import math
 import random
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 
@@ -420,3 +420,119 @@ def create_protocol(config: Config) -> Protocol:
 def max_message_bitsize(packet_bitsize: int) -> int:
     """Return the maximum payload size (in bits) for packets of the given size."""
     return 2 ** (packet_bitsize - 1)
+
+
+def _lt_expected_received_symbols(
+    k: int,
+    *,
+    # For small k, use explicit expected "received symbols needed"
+    # Populate this to match your implementation.
+    small_k_table: Dict[int, int] | None = None,
+    # Fallback asymptotic proxy params
+    c: float = 0.1,
+    delta: float = 0.05,
+    # Extra constant overhead even for larger k (implementation/decoder constants)
+    extra: int = 0,
+) -> int:
+    if k <= 0:
+        return 0
+
+    if small_k_table is not None and k in small_k_table:
+        return max(k, int(small_k_table[k]))
+
+    # Robust-Soliton-like proxy (asymptotic)
+    if k < 3:
+        return k + extra
+
+    s = c * math.sqrt(k) * math.log(k / delta)
+    if s <= 1e-12:
+        return k + extra
+
+    overhead = int(math.ceil(s * math.log(s / delta)))
+    return max(k, k + overhead + extra)
+
+
+def _expected_steps_to_get_r_successes_ge(
+    r: int,
+    pGB: float,
+    pBG: float,
+    pG: float,
+    pB: float,
+    start_in_good: bool,
+) -> float:
+    if r <= 0:
+        return 0.0
+    qG = pGB  # good -> bad
+    qB = pBG  # bad  -> good
+
+    FG_prev = 0.0
+    FB_prev = 0.0
+
+    for _ in range(1, r + 1):
+        a11 = 1.0 - (1.0 - pG) * (1.0 - qG)
+        a12 = -(1.0 - pG) * qG
+        b1 = 1.0 + pG * ((1.0 - qG) * FG_prev + qG * FB_prev)
+
+        a21 = -(1.0 - pB) * qB
+        a22 = 1.0 - (1.0 - pB) * (1.0 - qB)
+        b2 = 1.0 + pB * ((1.0 - qB) * FB_prev + qB * FG_prev)
+
+        det = a11 * a22 - a12 * a21
+        if abs(det) < 1e-15:
+            return float("inf")
+
+        FG = (b1 * a22 - b2 * a12) / det
+        FB = (a11 * b2 - a21 * b1) / det
+        FG_prev, FB_prev = FG, FB
+
+    return FG_prev if start_in_good else FB_prev
+
+
+def expected_packets_until_reconstructed(
+    gilbert_eliott_k: Tuple[float, float, float, float],  # pGB, pBG, pG, pB
+    packet_bitsize: int,
+    message_bitsize: int,
+) -> float:
+    pGB, pBG, pG, pB = gilbert_eliott_k
+
+    if message_bitsize <= 0:
+        return 0.0
+    if packet_bitsize <= 0:
+        raise ValueError("packet_bitsize must be > 0")
+
+    n = float(packet_bitsize)
+    M = float(message_bitsize)
+
+    # ---- continuous header / symbol split ----
+    logM = math.log2(M)
+    denom = n - logM
+    if denom <= 0.0:
+        return float("inf")
+
+    symbol_bits = n - logM + math.log2(denom)
+    if symbol_bits <= 0.0:
+        return float("inf")
+
+    # continuous k
+    k = M / symbol_bits
+
+    # ---- LT decoding overhead (continuous, implementation-aware) ----
+    alpha = max(0.0, math.log(k) - 1.0)  # redundancy due to singleton saturation
+    beta = 1.0  # peeling stall penalty
+
+    useful_packets = k * (1.0 + alpha) + beta * math.log(k + 1.0)
+
+    # ---- GE stationary success probability ----
+    denom = pBG + pGB
+    if denom <= 0.0:
+        return float("inf")
+
+    piG = pBG / denom
+    piB = pGB / denom
+
+    p_eff = piG * pG + piB * pB
+    if p_eff <= 0.0:
+        return float("inf")
+
+    # ---- expected packets until reconstruction ----
+    return useful_packets / p_eff

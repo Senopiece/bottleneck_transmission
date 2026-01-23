@@ -50,38 +50,65 @@ def create_protocol(config: Config) -> Protocol:
         # Message vector is directly the polynomial coefficients
         message_vector = make_message_vector(message, N, m)  # shape (m,)
 
-        # Yield samples
-        Nstates = (1 << N) - 1  # GF(2^n - 1) states
-        tails = set(np.uint16(i) for i in range(Nstates))
-        for x in range(Nstates):
-            y = evaluate_poly(np.uint16(x), message_vector, n, mask)
-            tails.discard(y)
+        q = (1 << N) - 1
+
+        def f(x: np.uint16) -> np.uint16:
+            return evaluate_poly(x, message_vector, n, mask)
+
+        # ----------------------------------------------------------------------
+        # Precompute tails = nodes with indegree 0 in the functional graph of f
+        # (i.e., values not attained as f(x) for any x).
+        # This is sampler-side only and does not depend on the channel.
+        # ----------------------------------------------------------------------
+        all_states = set(np.uint16(i) for i in range(q))
+
+        tails = set(all_states)
+        for x in range(q):
+            y = f(np.uint16(x))
+            if y in tails:
+                tails.discard(y)
 
         visited: Set[np.uint16] = set()
-        all_states = set(np.uint16(i) for i in range(Nstates))
-        curr: np.uint16 = np.uint16(1)
 
-        def reset():
-            nonlocal curr
-            tails_unvisited = tails - visited
-            remaining = all_states - visited
-            curr = list(tails_unvisited)[0] if tails_unvisited else list(remaining)[0]
+        # Pick a new start state, prioritizing unvisited tails
+        def pick_seed() -> np.uint16:
+            # Prefer an unvisited tail if any exist; otherwise any unvisited node
+            candidates = tails - visited
+            if candidates:
+                # deterministic-ish: take an arbitrary element
+                return next(iter(candidates))
+            candidates = all_states - visited
+            if candidates:
+                return next(iter(candidates))
+            # If we have exhausted all states, restart coverage
+            visited.clear()
+            # Recompute candidates after clearing
+            candidates = tails
 
-        reset()
+            # shuffle iterate for even distribution of delimiters / or bfs instead
+            return next(iter(candidates)) if candidates else np.uint16(0)
+
+        curr: np.uint16 = pick_seed()
 
         while True:
-            if curr in visited:
-                yield uint16_to_bool_array(curr, N)
-                yield np.ones(N, dtype=np.bool_)
-
-                if len(visited) == Nstates:
-                    visited.clear()
-
-                reset()
-
+            # Transmit current state as data
             yield uint16_to_bool_array(curr, N)
+
+            # Mark visited after transmitting it
             visited.add(curr)
-            curr = evaluate_poly(curr, message_vector, n, mask)
+
+            nxt = f(curr)
+
+            # If next would repeat a visited state, break adjacency with a delimiter and jump
+            if nxt in visited:
+                yield uint16_to_bool_array(nxt, N)
+                yield np.ones(
+                    N, dtype=np.bool_
+                )  # delimiter: breaks adjacency in estimator
+                curr = pick_seed()
+                continue
+
+            curr = nxt
 
     # ==========================================================================
     # Estimator fabric
@@ -130,88 +157,102 @@ def max_message_bitsize(packet_bitsize: int) -> int:
     return 0
 
 
-def estimate_packets_until_reconstructed(
-    deletion_prob: float, packet_bitsize: int, message_bitsize: int
+def expected_packets_until_reconstructed(
+    gilbert_eliott_k: Tuple[float, float, float, float],  # pGB, pBG, pG, pB
+    packet_bitsize: int,
+    message_bitsize: int,
 ) -> float:
     """
     Estimate E[number of transmitted packets until reconstruction]
-    for the given protocol under independent deletions.
+    under a Gilbert-Elliott deletion channel + sampler-delimiters.
 
-    Assumptions:
-      - i.i.d. deletion channel with probability `deletion_prob`
-      - sampler delimiter process approximated as a renewal process
-        induced by a random functional graph on GF(2^N - 1)
-      - duplicates among early (x,y) pairs are negligible up to m samples
+    Channel:
+      - States: G (good), B (bad)
+      - Transitions: P(G->B)=pGB, P(B->G)=pBG
+      - Deletion probs: pG in G, pB in B
+      - If not deleted, the packet is received.
+    Sampler:
+      - With probability lambda_delim a transmission is a delimiter (breaks adjacency).
+      - Approximated via random-mapping renewal: lambda_delim = 1/(e+2),
+        and P(two consecutive transmissions are both data) ≈ s_data_adj = 1 - 2*lambda_delim.
 
-    its tight for up to some inflection message_bitsize, after that coupon collector regime kicks in
-    the more faulty channel is, the lower this inflection message_bitsize
-    as we consider a low faulty channel, this becomes a tight estimate overall
+    Reconstruction model:
+      - Estimator needs ~m adjacent received data-packet pairs (your prior approximation).
+      - Uses the same closed-form approximation in terms of:
+          P1 = P(a single transmission yields a received data packet)
+          P2 = P(two consecutive transmissions yield two received data packets)
 
-    Parameters
-    ----------
-    deletion_prob : float
-        Packet deletion probability d, 0 <= d < 1.
-    packet_bitsize : int
-        N, packet size in bits.
-    message_bitsize : int
-        Payload size in bits.
-
-    Returns
-    -------
-    float
-        Expected number of transmitted packets until message reconstruction.
+    Notes:
+      - If pGB + pBG == 0, the chain has no unique stationary distribution (two absorbing states).
+        This implementation assumes the process starts in G (piG=1, piB=0).
     """
-    if not (0.0 <= deletion_prob < 1.0):
-        raise ValueError("deletion_prob must be in [0,1).")
     if packet_bitsize < 1:
         raise ValueError("packet_bitsize must be >= 1")
     if message_bitsize <= 0:
         return 0.0
 
+    pGB, pBG, pG, pB = gilbert_eliott_k
+
+    # Validate probabilities
+    for name, v in [("pGB", pGB), ("pBG", pBG), ("pG", pG), ("pB", pB)]:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"{name} must be in [0,1].")
+
     n = packet_bitsize
     w = message_bitsize
 
-    # Same m as the protocol uses, but smooth one
-    #
-    # 2^w = (2^n - 1)^m
-    # w = mlog2(2^n - 1)
-    # m = w / log2(2^n - 1)
-
+    # m ≈ w / log2(2^n - 1)
     q = (1 << n) - 1  # 2^n - 1
-    b = math.log(q, 2)
+    b = math.log(q, 2.0)
     m = w / b
 
     if m > q:
         return math.inf
 
     # Sampler-induced delimiter statistics
-    #
-    # Random-mapping approximation:
-    #   expected number of restart events per full traversal:
-    #       L ≈ q / e
-    #
-    # delimiter fraction:
-    #   λ = L / (q + 2L) = 1 / (e + 2)
-    #
-    # fraction of consecutive transmissions that are both data:
-    #   s = 1 - 2λ = e / (e + 2)
-    lambda_delim = 1.0 / (math.e + 2.0)
-    s_data_adj = 1.0 - 2.0 * lambda_delim
+    s_data_adj = 1.0 - 2.0 / (math.e + 2.0)
+    lambda_delim = 0.5 * (1.0 - s_data_adj)
 
-    # Channel + sampler
-    d = deletion_prob
-    P1 = (1.0 - lambda_delim) * (
-        1.0 - d
-    )  # probability a single transmission yields a received data packet
-    P2 = (
-        s_data_adj * (1.0 - d) ** 2
-    )  # probability two consecutive transmissions yield two received data packets
+    # Stationary distribution of the GE chain (if it exists)
+    denom = pGB + pBG
+    if denom > 0.0:
+        piG = pBG / denom
+        piB = pGB / denom
+    else:
+        # No transitions: absorbing; assume start in Good
+        piG, piB = 1.0, 0.0
 
-    if P2 <= 0.0 or P1 <= 0.0 or P1 <= P2:
+    # P1: one transmission is (data) and received
+    #   = P(not delimiter) * E_state[ receive_prob(state) ]
+    recv_marg = piG * pG + piB * pB
+    P1 = (1.0 - lambda_delim) * recv_marg
+
+    # P2: two consecutive transmissions are both (data) and both received
+    #   = P(two are data) * P(both received over two steps of Markov chain)
+    #
+    # Markov two-step receive probability:
+    #   sum_i pi_i * sum_j P(i->j) * r_i * r_j
+    pGG = 1.0 - pGB
+    pGB_ = pGB
+    pBG_ = pBG
+    pBB = 1.0 - pBG
+
+    two_step_recv = piG * (pGG * (pG * pG) + pGB_ * (pG * pB)) + piB * (
+        pBG_ * (pB * pG) + pBB * (pB * pB)
+    )
+    P2 = s_data_adj * two_step_recv
+
+    # Sanity / degeneracy checks
+    if P1 <= 0.0 or P2 <= 0.0:
+        return math.inf
+
+    # Prior closed form requires P1 > P2 to avoid negative "overhead" term.
+    # With strong positive correlation, we can get P2 >= P1; in that case,
+    # the formula is not applicable as-written, so return inf (signal "model mismatch").
+    if P2 >= P1:
         return math.inf
 
     # Exact expectation for "need m adjacent successes"
-    #
     #   E[T] = m / P2 + (1 - P1) / (P1 - P2)
     overhead = (1.0 - P1) / (P1 - P2)
     return m / P2 + overhead
