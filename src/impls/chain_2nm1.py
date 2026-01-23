@@ -9,11 +9,7 @@ from ._utils.conversions import (
     message_from_message_vector,
     uint16_to_bool_array,
 )
-from ._utils.fields.gf2nm1 import (
-    evaluate_poly,
-    interpolate_poly,
-    make_feld,
-)
+from ._utils.fields import gf2nm1
 from ._interface import Config, Protocol, Message, Sampler, Estimator
 from ._utils.intmath import (
     ispowprime_1_15,
@@ -41,7 +37,7 @@ def create_protocol(config: Config) -> Protocol:
         packet_bitsize,
         (1 << packet_bitsize) - 1,
     )
-    n, mask = make_feld(N)
+    n, mask = gf2nm1.make_field(N)
 
     # ==========================================================================
     # Sampler fabric
@@ -50,18 +46,17 @@ def create_protocol(config: Config) -> Protocol:
         # Message vector is directly the polynomial coefficients
         message_vector = make_message_vector(message, N, m)  # shape (m,)
 
-        q = (1 << N) - 1
-
         def f(x: np.uint16) -> np.uint16:
-            return evaluate_poly(x, message_vector, n, mask)
+            return gf2nm1.evaluate_poly(x, message_vector, n, mask)
+
+        q = (1 << N) - 1
+        all_states = set(np.uint16(i) for i in range(q))
 
         # ----------------------------------------------------------------------
         # Precompute tails = nodes with indegree 0 in the functional graph of f
         # (i.e., values not attained as f(x) for any x).
         # This is sampler-side only and does not depend on the channel.
         # ----------------------------------------------------------------------
-        all_states = set(np.uint16(i) for i in range(q))
-
         tails = set(all_states)
         for x in range(q):
             y = f(np.uint16(x))
@@ -70,45 +65,36 @@ def create_protocol(config: Config) -> Protocol:
 
         visited: Set[np.uint16] = set()
 
-        # Pick a new start state, prioritizing unvisited tails
-        def pick_seed() -> np.uint16:
-            # Prefer an unvisited tail if any exist; otherwise any unvisited node
-            candidates = tails - visited
-            if candidates:
-                # deterministic-ish: take an arbitrary element
-                return next(iter(candidates))
-            candidates = all_states - visited
-            if candidates:
-                return next(iter(candidates))
-            # If we have exhausted all states, restart coverage
+        # pick a new start state, prioritizing unvisited tails
+        def reset() -> np.uint16:
+            tails_unvisited = tails - visited
+            if tails_unvisited:
+                return next(iter(tails_unvisited))
+
+            remaining = all_states - visited
+            if remaining:
+                return next(iter(remaining))
+
             visited.clear()
-            # Recompute candidates after clearing
             candidates = tails
 
-            # shuffle iterate for even distribution of delimiters / or bfs instead
             return next(iter(candidates)) if candidates else np.uint16(0)
 
-        curr: np.uint16 = pick_seed()
+        curr = reset()
 
         while True:
-            # Transmit current state as data
+            # yield, mark visited and compute next
             yield uint16_to_bool_array(curr, N)
-
-            # Mark visited after transmitting it
             visited.add(curr)
-
             nxt = f(curr)
 
-            # If next would repeat a visited state, break adjacency with a delimiter and jump
+            # if next would repeat a visited state, break adjacency with a delimiter and jump
             if nxt in visited:
                 yield uint16_to_bool_array(nxt, N)
-                yield np.ones(
-                    N, dtype=np.bool_
-                )  # delimiter: breaks adjacency in estimator
-                curr = pick_seed()
-                continue
-
-            curr = nxt
+                yield np.ones(N, dtype=np.bool_)  # delimiter
+                curr = reset()
+            else:
+                curr = nxt
 
     # ==========================================================================
     # Estimator fabric
@@ -140,7 +126,7 @@ def create_protocol(config: Config) -> Protocol:
             inputs[i] = x_val
             outputs[i] = y_val
 
-        message_vector = interpolate_poly(outputs, inputs, n, mask)
+        message_vector = gf2nm1.interpolate_poly(outputs, inputs, n, mask)
         message = message_from_message_vector(message_vector, N, message_bitsize)
 
         return message

@@ -43,7 +43,7 @@ def _primitive_poly_int(n: int) -> int:
     return (1 << n) | (1 << a) | 1
 
 
-def make_feld(N: int):
+def make_field(N: int):
     n = N
     poly = np.uint16(_primitive_poly_int(N))  # includes x^n term
     mask = np.uint16((1 << N) - 1)  # keep n bits

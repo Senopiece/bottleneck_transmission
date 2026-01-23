@@ -8,7 +8,7 @@ from ..intmath import ispowprime_1_15
 # ==========================================================================
 
 
-def make_feld(N: int):
+def make_field(N: int):
     if not 1 <= N <= 15:
         raise ValueError(f"Spupported N in [1, 15], got={N}")  # due to uint16 usage
     if not ispowprime_1_15(N):
