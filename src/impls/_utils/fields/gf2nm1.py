@@ -14,14 +14,14 @@ def make_field(N: int):
     if not ispowprime_1_15(N):
         raise ValueError("Spupported 2^N - 1 appears to be not a prime")
 
-    n = np.uint16(N)
+    n = N
     mask = np.uint16((1 << N) - 1)  # a prime
 
     return n, mask
 
 
 @nb.njit(inline="always", fastmath=True)
-def add(a: np.uint16, b: np.uint16, n: np.uint16, mask: np.uint16) -> np.uint16:
+def add(a: np.uint16, b: np.uint16, n: int, mask: np.uint16) -> np.uint16:
     s = a + b
     r = (s & mask) + (s >> n)
     t = r - mask
@@ -34,7 +34,7 @@ def neg(a: np.uint16, mask: np.uint16) -> np.uint16:
 
 
 @nb.njit(inline="always", fastmath=True)
-def mul(a: np.uint16, b: np.uint16, n: np.uint16, mask: np.uint16) -> np.uint16:
+def mul(a: np.uint16, b: np.uint16, n: int, mask: np.uint16) -> np.uint16:
     # Widen to avoid overflow: for n<=15, (2^n-2)^2 < 2^30 fits in uint32
     x = np.uint32(a) * np.uint32(b)
 
@@ -54,7 +54,7 @@ def mul(a: np.uint16, b: np.uint16, n: np.uint16, mask: np.uint16) -> np.uint16:
 
 
 @nb.njit(inline="always", fastmath=True)
-def _pow(base: np.uint16, e: int, n: np.uint16, mask: np.uint16) -> np.uint16:
+def _pow(base: np.uint16, e: int, n: int, mask: np.uint16) -> np.uint16:
     if e < 0:
         raise ValueError("negative exponent not supported for mod (2^n-1)")
     if e == 0:
@@ -73,7 +73,7 @@ def _pow(base: np.uint16, e: int, n: np.uint16, mask: np.uint16) -> np.uint16:
 
 
 @nb.njit(inline="always", fastmath=True)
-def inv(a: np.uint16, n: np.uint16, mask: np.uint16) -> np.uint16:
+def inv(a: np.uint16, n: int, mask: np.uint16) -> np.uint16:
     # In a field mod prime p, 0 has no inverse
     if a == 0:
         return np.uint16(0)
@@ -92,7 +92,7 @@ def inv(a: np.uint16, n: np.uint16, mask: np.uint16) -> np.uint16:
 def interpolate_newton_poly(
     y: np.ndarray,  # (m,) uint16, values f(x[i])
     x: np.ndarray,  # (m,) uint16, distinct x[i]
-    n: np.uint16,
+    n: int,
     mask: np.uint16,
 ) -> np.ndarray:
     """
@@ -149,7 +149,7 @@ def interpolate_newton_poly(
 def newton_to_poly(
     coeffs: np.ndarray,  # (m,) uint16: Newton coeffs on `basis`
     basis: np.ndarray,  # (m,) uint16: nodes x0..x_{m-1} (distinct)
-    n: np.uint16,
+    n: int,
     mask: np.uint16,
 ) -> np.ndarray:
     """
@@ -209,7 +209,7 @@ def newton_to_poly(
 def interpolate_poly(
     y: np.ndarray,  # (m,) uint16, values f(x[i])
     x: np.ndarray,  # (m,) uint16, distinct x[i]
-    n: np.uint16,
+    n: int,
     mask: np.uint16,
 ) -> np.ndarray:
     dd = interpolate_newton_poly(y, x, n, mask)
@@ -220,7 +220,7 @@ def interpolate_poly(
 def evaluate_poly(
     t: np.uint16,
     coeffs: np.ndarray,  # shape (m,), dtype uint16  (c0..c_{m-1})
-    n: np.uint16,
+    n: int,
     mask: np.uint16,
 ) -> np.uint16:
     """

@@ -38,18 +38,18 @@ def create_protocol(config: Config) -> Protocol:
         (1 << packet_bitsize) - 1,
     )
     n, mask = gf2nm1.make_field(N)
+    q = (1 << N) - 1
 
     # ==========================================================================
     # Sampler fabric
     # ==========================================================================
     def make_sampler(message: Message) -> Sampler:
         # Message vector is directly the polynomial coefficients
-        message_vector = make_message_vector(message, N, m)  # shape (m,)
+        message_vector = make_message_vector(message, m, q)  # shape (m,)
 
         def f(x: np.uint16) -> np.uint16:
             return gf2nm1.evaluate_poly(x, message_vector, n, mask)
 
-        q = (1 << N) - 1
         all_states = set(np.uint16(i) for i in range(q))
 
         # ----------------------------------------------------------------------
@@ -127,7 +127,7 @@ def create_protocol(config: Config) -> Protocol:
             outputs[i] = y_val
 
         message_vector = gf2nm1.interpolate_poly(outputs, inputs, n, mask)
-        message = message_from_message_vector(message_vector, N, message_bitsize)
+        message = message_from_message_vector(message_vector, message_bitsize, q)
 
         return message
 

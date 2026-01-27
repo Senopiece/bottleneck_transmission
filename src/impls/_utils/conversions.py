@@ -56,24 +56,23 @@ def bool_array_to_uint16(bits: np.ndarray) -> np.uint16:
 ## ======================================================================================
 
 
-def make_message_vector(message: np.ndarray, n: int, m: int) -> np.ndarray:
+def make_message_vector(message: np.ndarray, m: int, q: int) -> np.ndarray:
     """
-    Convert message bits to vector in GF(2^n - 1).
+    Convert message bits to vector in GF(q).
 
     Args:
         message: bits of the message
-        n: packet bitsize
-        m: number of semisymbols
+        m: number of symbols
+        q: alphabet size
     Returns:
         vector as np.ndarray of shape (m,), dtype=np.uint16
     """
     int_msg = bits_to_int(message)
 
-    q = (1 << n) - 1
     vec = np.empty(m, dtype=np.uint16)
 
     for i in range(m):
-        d = int_msg % q  # GF(2^n - 1) elements
+        d = int_msg % q  # GF(q) elements
         int_msg //= q
         vec[i] = np.uint16(d)
 
@@ -82,19 +81,19 @@ def make_message_vector(message: np.ndarray, n: int, m: int) -> np.ndarray:
 
 def message_from_message_vector(
     message_vector: np.ndarray,
-    n: int,
     message_bitsize: int,
+    q: int,
 ):
     """
-    Convert message vector in GF(2^n - 1) back to message bits.
+    Convert message vector in GF(q) back to message bits.
 
     Args:
         message_vector: np.ndarray of shape (m,), dtype=np.uint16
-        n: packet bitsize
+        message_bitsize: expected size of the out message
+        q: alphabet size
     Returns:
         message bits as np.ndarray of shape (message_bitsize,), dtype=np._bool
     """
-    q = (1 << n) - 1
     int_msg = 0
 
     for i in range(message_vector.shape[0] - 1, -1, -1):
