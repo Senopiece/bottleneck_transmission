@@ -45,6 +45,8 @@ def create_protocol(config: Config) -> Protocol:
     # ==========================================================================
     def make_sampler(message: Message) -> Sampler:
         # Message vector is directly the polynomial coefficients
+        # TODO: try encoding into permutation polynomials
+        # TODO: try encoding into full-cycle permutation polynomials
         message_vector = make_message_vector(message, m, q)  # shape (m,)
 
         def f(x: np.uint16) -> np.uint16:
