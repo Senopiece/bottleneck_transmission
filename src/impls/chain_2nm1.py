@@ -52,51 +52,72 @@ def create_protocol(config: Config) -> Protocol:
         def f(x: np.uint16) -> np.uint16:
             return gf2nm1.evaluate_poly(x, message_vector, n, mask)
 
-        all_states = set(np.uint16(i) for i in range(q))
-
-        # ----------------------------------------------------------------------
-        # Precompute tails = nodes with indegree 0 in the functional graph of f
-        # (i.e., values not attained as f(x) for any x).
-        # This is sampler-side only and does not depend on the channel.
-        # ----------------------------------------------------------------------
-        tails = set(all_states)
+        # Precompute transitions once, then greedily decompose into longest
+        # simple paths over alive nodes (same spirit as theory notebook).
+        nxt = np.empty(q, dtype=np.uint16)
         for x in range(q):
-            y = f(np.uint16(x))
-            if y in tails:
-                tails.discard(y)
+            nxt[x] = f(np.uint16(x))
 
-        visited: Set[np.uint16] = set()
+        alive = np.ones(q, dtype=np.bool_)
 
-        # pick a new start state, prioritizing unvisited tails
-        def reset() -> np.uint16:
-            tails_unvisited = tails - visited
-            if tails_unvisited:
-                return next(iter(tails_unvisited))
+        def orbit_path(start: int) -> Tuple[list[np.uint16], np.uint16]:
+            seen: set[int] = set()
+            path: list[np.uint16] = []
+            cur = start
 
-            remaining = all_states - visited
-            if remaining:
-                return next(iter(remaining))
+            while alive[cur] and cur not in seen:
+                seen.add(cur)
+                path.append(np.uint16(cur))
+                cur = int(nxt[cur])
 
-            visited.clear()
-            candidates = tails
+            # cur is guaranteed to be previously visited (either in this path
+            # or by an earlier selected path).
+            return path, np.uint16(cur)
 
-            return next(iter(candidates)) if candidates else np.uint16(0)
+        paths: list[list[np.uint16]] = []
+        score = 0
+        min_score_portion = 0.2  # TODO: need to find an optimal one for different q - this surely will not be linear (0.2 is good for q=32)
+        # TODO: from the theory it was expected that the optimal score would be smth like 2-10, but there it seems that just biger is better - investigate why
+        scaler = 100  # TODO: need to find an optimal one for different q, but seems like its ok to be constate for every q
+        # seems like this is the optimal target score, however TODO: need to be studied is just linear scaling optimal, doesnt it need bias?
+        target_score = min(max(scaler * m, min_score_portion * q), q)
 
-        curr = reset()
+        # TODO: shortcut to cycle without delimiters if the biggest cycle is longer then target scrore
+
+        # NOTE: this thing is heavy and could be very much optimized
+        while score < target_score and np.any(alive):
+            best_path: list[np.uint16] | None = None
+            best_terminal = np.uint16(0)
+            best_len = -1
+
+            for s in range(q):
+                if not alive[s]:
+                    continue
+                candidate_path, terminal = orbit_path(s)
+                candidate_len = len(candidate_path)
+                if candidate_len > best_len:
+                    best_len = candidate_len
+                    best_path = candidate_path
+                    best_terminal = terminal
+
+            if best_path is None or best_len <= 0:
+                break
+
+            emitted_path = best_path + [best_terminal]
+            paths.append(emitted_path)
+            score += len(emitted_path) - 1
+
+            for v in best_path:
+                alive[int(v)] = False
+
+        if not paths:
+            paths = [[np.uint16(0), np.uint16(0)]]
 
         while True:
-            # yield, mark visited and compute next
-            yield uint16_to_bool_array(curr, N)
-            visited.add(curr)
-            nxt = f(curr)
-
-            # if next would repeat a visited state, break adjacency with a delimiter and jump
-            if nxt in visited:
-                yield uint16_to_bool_array(nxt, N)
-                yield np.ones(N, dtype=np.bool_)  # delimiter
-                curr = reset()
-            else:
-                curr = nxt
+            for path in paths:
+                for state in path:
+                    yield uint16_to_bool_array(state, N)
+                yield np.ones(N, dtype=np.bool_)  # delimiter between paths
 
     # ==========================================================================
     # Estimator fabric
