@@ -46,55 +46,74 @@ def create_protocol(config: Config) -> Protocol:
         def f(x: np.uint16) -> np.uint16:
             return gf2n.evaluate_poly(x, message_vector, n, mask, red)
 
-        all_states = set(np.uint16(i) for i in range(q))
-
-        # ----------------------------------------------------------------------
-        # Precompute tails = nodes with indegree 0 in the functional graph of f
-        # (i.e., values not attained as f(x) for any x).
-        # This is sampler-side only and does not depend on the channel.
-        # ----------------------------------------------------------------------
-        tails = set(all_states)
+        # Precompute transitions and greedily pick longest simple paths.
+        nxt = np.empty(q, dtype=np.uint16)
         for x in range(q):
-            y = f(np.uint16(x))
-            if y in tails:
-                tails.discard(y)
+            nxt[x] = f(np.uint16(x))
 
-        visited: Set[np.uint16] = set()
+        alive = np.ones(q, dtype=np.bool_)
 
-        # pick a new start state, prioritizing unvisited tails
-        def reset() -> np.uint16:
-            tails_unvisited = tails - visited
-            if tails_unvisited:
-                return next(iter(tails_unvisited))
+        def orbit_path(start: int) -> Tuple[list[np.uint16], np.uint16]:
+            seen: set[int] = set()
+            path: list[np.uint16] = []
+            cur = start
 
-            remaining = all_states - visited
-            if remaining:
-                return next(iter(remaining))
+            while alive[cur] and cur not in seen:
+                seen.add(cur)
+                path.append(np.uint16(cur))
+                cur = int(nxt[cur])
 
-            visited.clear()
-            candidates = tails
+            return path, np.uint16(cur)
 
-            return next(iter(candidates)) if candidates else np.uint16(0)
+        paths: list[list[np.uint16]] = []
+        score = 0
+        min_score_portion = 0.2
+        scaler = 100
+        target_score = min(max(scaler * m, min_score_portion * q), q)
 
-        curr = reset()
+        while score < target_score and np.any(alive):
+            best_path: list[np.uint16] | None = None
+            best_terminal = np.uint16(0)
+            best_len = -1
+
+            for s in range(q):
+                if not alive[s]:
+                    continue
+                candidate_path, terminal = orbit_path(s)
+                candidate_len = len(candidate_path)
+                if candidate_len > best_len:
+                    best_len = candidate_len
+                    best_path = candidate_path
+                    best_terminal = terminal
+
+            if best_path is None or best_len <= 0:
+                break
+
+            emitted_path = best_path + [best_terminal]
+            paths.append(emitted_path)
+            score += len(emitted_path) - 1
+
+            for v in best_path:
+                alive[int(v)] = False
+
+        if not paths:
+            paths = [[np.uint16(0), np.uint16(0)]]
+
         phase = True
 
         def phased_output(value: np.uint16):
             return uint16_to_bool_array(value + q if phase else value, N)
 
         while True:
-            # yield, mark visited and compute next
-            yield phased_output(curr)
-            visited.add(curr)
-            nxt = f(curr)
+            for path in paths:
+                last_idx = len(path) - 1
+                for i, state in enumerate(path):
+                    yield phased_output(state)
 
-            # if next would repeat a visited state, break adjacency with a delimiter and jump
-            phase = not phase
-            if nxt in visited:
-                yield phased_output(nxt)
-                curr = reset()
-            else:
-                curr = nxt
+                    # Keep the phase unchanged after terminal so the next path
+                    # starts with same phase and acts as reset marker.
+                    if i != last_idx:
+                        phase = not phase
 
     # ==========================================================================
     # Estimator fabric

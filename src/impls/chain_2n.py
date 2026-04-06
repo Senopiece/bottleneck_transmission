@@ -64,54 +64,72 @@ def create_protocol(config: Config) -> Protocol:
                 np.uint16(x), coeffs, n, mask, red
             )
 
-        all_states = set(np.uint16(i) for i in range(q))
-
-        # ----------------------------------------------------------------------
-        # Precompute tails = nodes with indegree 0 in the functional graph of f
-        # (i.e., values not attained as f(x) for any x).
-        # This is sampler-side only and does not depend on the channel.
-        # ----------------------------------------------------------------------
-        tails = set(np.uint16(i) for i in range(z))
-        for x in range(z):
-            y = f(np.uint16(x))
-            tails.discard(y)
-
         delimiter = np.uint16(z)  # all ones
-        visited = {delimiter}
 
-        # pick a new start state, prioritizing unvisited tails
-        def reset():
-            tails_unvisited = tails - visited
-            if tails_unvisited:
-                return next(iter(tails_unvisited))
+        # Greedy longest paths over non-delimiter states [0, z-1].
+        nxt = np.empty(z, dtype=np.uint16)
+        for x in range(z):
+            nxt[x] = f(np.uint16(x))
 
-            remaining = all_states - visited
-            if remaining:
-                return next(iter(remaining))
+        alive = np.ones(z, dtype=np.bool_)
 
-            visited.clear()
-            visited.add(delimiter)
-            tails_unvisited = tails - visited
+        def orbit_path(start: int) -> Tuple[list[np.uint16], np.uint16]:
+            seen: set[int] = set()
+            path: list[np.uint16] = []
+            cur = start
 
-            return next(iter(tails_unvisited)) if tails_unvisited else np.uint16(0)
+            while alive[cur] and cur not in seen:
+                seen.add(cur)
+                path.append(np.uint16(cur))
+                nxt_cur = int(nxt[cur])
+                if nxt_cur == z:
+                    return path, delimiter
+                cur = nxt_cur
 
-        curr = reset()
+            return path, np.uint16(cur)
+
+        paths: list[list[np.uint16]] = []
+        score = 0
+        min_score_portion = 0.2
+        scaler = 100
+        target_score = min(max(scaler * m, min_score_portion * q), q)
+
+        while score < target_score and np.any(alive):
+            best_path: list[np.uint16] | None = None
+            best_terminal = delimiter
+            best_len = -1
+
+            for s in range(z):
+                if not alive[s]:
+                    continue
+                candidate_path, terminal = orbit_path(s)
+                candidate_len = len(candidate_path)
+                if candidate_len > best_len:
+                    best_len = candidate_len
+                    best_path = candidate_path
+                    best_terminal = terminal
+
+            if best_path is None or best_len <= 0:
+                break
+
+            emitted_path = best_path + [best_terminal]
+            paths.append(emitted_path)
+            score += len(emitted_path) - 1
+
+            for v in best_path:
+                alive[int(v)] = False
+
+        if not paths:
+            paths = [[np.uint16(0), np.uint16(0)]]
 
         while True:
-            # yield, mark visited and compute next
-            yield uint16_to_bool_array(curr, N)
-            visited.add(curr)
-            nxt = f(curr)
-
-            # if next would repeat a visited valid state, yield it then reset
-            # if the next is delimiter - a force reset occurs, make sure not to yield delimiter twice
-            if nxt in visited:
-                if nxt != delimiter:
-                    yield uint16_to_bool_array(nxt, N)
-                yield np.ones(n, dtype=np.bool_)  # delimiter
-                curr = reset()
-            else:
-                curr = nxt
+            for path in paths:
+                for state in path:
+                    if state == delimiter:
+                        yield np.ones(N, dtype=np.bool_)
+                    else:
+                        yield uint16_to_bool_array(state, N)
+                yield np.ones(N, dtype=np.bool_)
 
     # ==========================================================================
     # Estimator fabric

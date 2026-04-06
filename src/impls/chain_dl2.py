@@ -60,10 +60,14 @@ def create_protocol(config: Config) -> Protocol:
 
         # Message vectors are directly the polynomial coefficients
         message_vector_a = (
-            make_message_vector(msg_a, m1, q) if m1 > 0 else np.empty(0, dtype=np.uint16)
+            make_message_vector(msg_a, m1, q)
+            if m1 > 0
+            else np.empty(0, dtype=np.uint16)
         )
         message_vector_b = (
-            make_message_vector(msg_b, m2, q) if m2 > 0 else np.empty(0, dtype=np.uint16)
+            make_message_vector(msg_b, m2, q)
+            if m2 > 0
+            else np.empty(0, dtype=np.uint16)
         )
 
         def f1(x: np.uint16) -> np.uint16:
@@ -80,70 +84,123 @@ def create_protocol(config: Config) -> Protocol:
                 else np.uint16(0)
             )
 
-        all_states = set(np.uint16(i) for i in range(q))
-
-        # ----------------------------------------------------------------------
-        # Precompute tails for each phase domain:
-        # tailsA are nodes in A unreachable by f2 outputs (B -> A),
-        # tailsB are nodes in B unreachable by f1 outputs (A -> B).
-        # ----------------------------------------------------------------------
-        tails_a = set(all_states)
+        # Precompute transitions and greedily pick longest simple paths over
+        # phase-state pairs (A/B domains).
+        nxt_a = np.empty(q, dtype=np.uint16)  # A -> B via f1
+        nxt_b = np.empty(q, dtype=np.uint16)  # B -> A via f2
         for x in range(q):
-            y = f2(np.uint16(x))
-            if y in tails_a:
-                tails_a.discard(y)
+            xv = np.uint16(x)
+            nxt_a[x] = f1(xv)
+            nxt_b[x] = f2(xv)
 
-        tails_b = set(all_states)
-        for x in range(q):
-            y = f1(np.uint16(x))
-            if y in tails_b:
-                tails_b.discard(y)
+        alive_a = np.ones(q, dtype=np.bool_)
+        alive_b = np.ones(q, dtype=np.bool_)
 
-        visited_a: Set[np.uint16] = set()
-        visited_b: Set[np.uint16] = set()
+        def orbit_path(start: int, start_phase_b: bool):
+            seen: set[Tuple[bool, int]] = set()
+            path: list[Tuple[np.uint16, bool]] = []
+            cur = start
+            phase_b = start_phase_b
+
+            while True:
+                if phase_b:
+                    if (not alive_b[cur]) or ((phase_b, cur) in seen):
+                        return path, (np.uint16(cur), phase_b)
+                else:
+                    if (not alive_a[cur]) or ((phase_b, cur) in seen):
+                        return path, (np.uint16(cur), phase_b)
+
+                seen.add((phase_b, cur))
+                path.append((np.uint16(cur), phase_b))
+
+                if phase_b:
+                    cur = int(nxt_b[cur])
+                else:
+                    cur = int(nxt_a[cur])
+                phase_b = not phase_b
+
+        paths: list[list[Tuple[np.uint16, bool]]] = []
+        m = m1 + m2
+        score = 0
+        min_score_portion = 0.2
+        scaler = 100
+        q_total = 2 * q
+        target_score = min(max(scaler * m, min_score_portion * q_total), q_total)
+
+        while score < target_score and (np.any(alive_a) or np.any(alive_b)):
+            best_path: list[Tuple[np.uint16, bool]] | None = None
+            best_terminal: Tuple[np.uint16, bool] = (np.uint16(0), False)
+            best_len = -1
+
+            for s in range(q):
+                if alive_a[s]:
+                    candidate_path, terminal = orbit_path(s, False)
+                    candidate_len = len(candidate_path)
+                    if candidate_len > best_len:
+                        best_len = candidate_len
+                        best_path = candidate_path
+                        best_terminal = terminal
+
+                if alive_b[s]:
+                    candidate_path, terminal = orbit_path(s, True)
+                    candidate_len = len(candidate_path)
+                    if candidate_len > best_len:
+                        best_len = candidate_len
+                        best_path = candidate_path
+                        best_terminal = terminal
+
+            if best_path is None or best_len <= 0:
+                break
+
+            emitted_path = best_path + [best_terminal]
+            paths.append(emitted_path)
+            score += len(emitted_path) - 1
+
+            for v, v_phase_b in best_path:
+                if v_phase_b:
+                    alive_b[int(v)] = False
+                else:
+                    alive_a[int(v)] = False
+
+        if not paths:
+            paths = [[(np.uint16(0), False), (np.uint16(0), False)]]
+
+        paths_by_start_phase = {
+            False: [p for p in paths if not p[0][1]],
+            True: [p for p in paths if p[0][1]],
+        }
+
+        phase_cursor = {False: 0, True: 0}
+
+        def next_path(required_start_phase_b: bool):
+            primary = paths_by_start_phase[required_start_phase_b]
+            if primary:
+                idx = phase_cursor[required_start_phase_b] % len(primary)
+                phase_cursor[required_start_phase_b] += 1
+                return primary[idx]
+
+            fallback_phase_b = not required_start_phase_b
+            fallback = paths_by_start_phase[fallback_phase_b]
+            if fallback:
+                idx = phase_cursor[fallback_phase_b] % len(fallback)
+                phase_cursor[fallback_phase_b] += 1
+                return fallback[idx]
+
+            return paths[0]
 
         def phased_output(value: np.uint16, is_phase_b: bool):
             return uint16_to_bool_array(value + (q if is_phase_b else 0), N)
 
-        # pick a new start state, prioritizing unvisited tails for the current phase
-        def reset(is_phase_b: bool) -> np.uint16:
-            tails = tails_b if is_phase_b else tails_a
-            visited = visited_b if is_phase_b else visited_a
-
-            tails_unvisited = tails - visited
-            if tails_unvisited:
-                return next(iter(tails_unvisited))
-
-            remaining = all_states - visited
-            if remaining:
-                return next(iter(remaining))
-
-            visited_a.clear()
-            visited_b.clear()
-            candidates = tails_b if is_phase_b else tails_a
-            return next(iter(candidates)) if candidates else np.uint16(0)
-
-        phase_b = False  # start in A
-        curr = reset(phase_b)
-
+        required_start_phase_b = paths[0][0][1]
         while True:
-            # yield, mark visited and compute next
-            yield phased_output(curr, phase_b)
-            if phase_b:
-                visited_b.add(curr)
-                nxt = f2(curr)  # B -> A
-            else:
-                visited_a.add(curr)
-                nxt = f1(curr)  # A -> B
-
-            # if next would repeat a visited state, break adjacency with a delimiter and jump
-            phase_b = not phase_b
-            visited_next = visited_b if phase_b else visited_a
-            if nxt in visited_next:
-                yield phased_output(nxt, phase_b)
-                curr = reset(phase_b)
-            else:
-                curr = nxt
+            path = next_path(required_start_phase_b)
+            for i, (state, state_phase_b) in enumerate(path):
+                if i > 0 and path[i - 1][1] == state_phase_b:
+                    raise RuntimeError(
+                        "Sampler path has non-alternating phase sequence."
+                    )
+                yield phased_output(state, state_phase_b)
+            required_start_phase_b = path[-1][1]
 
     # ==========================================================================
     # Estimator fabric
