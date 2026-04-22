@@ -13,9 +13,15 @@ from ._utils.conversions import (
 )
 
 # Domain:
-# skip_probability: [0, 1)
+# deletion_probability: [0, 1)
 # corruption_probability: 0
-# skip_observation: 1.0
+# deletion_observation: 1.0
+
+# Number of previous (n-1)-bit symbols packed into x for f(x).
+PREFIX = 1
+
+# Keep state-space bounded; this implementation is tailored for small packet sizes.
+MAX_PREFIX_INPUT_BITS = 16
 
 
 def _robust_soliton_cdf(k: int, c: float = 0.1, delta: float = 0.05) -> List[float]:
@@ -63,7 +69,7 @@ def _robust_soliton_cdf(k: int, c: float = 0.1, delta: float = 0.05) -> List[flo
 
 
 def _subset_from_x(
-    x: np.uint16,
+    x: int,
     k: int,
     cdf: List[float],
     salt: int,
@@ -95,6 +101,13 @@ def _subset_from_x(
     return subset
 
 
+def _pack_prefix_symbols(symbols: List[int], z: int) -> int:
+    x = 0
+    for symbol in symbols:
+        x = (x << z) | int(symbol)
+    return x
+
+
 def _peel_add_equation(
     x: int,
     y: int,
@@ -107,7 +120,7 @@ def _peel_add_equation(
     if k <= 0:
         return False
 
-    subset = _subset_from_x(np.uint16(x), k, cdf, salt, singleton_limit=k)
+    subset = _subset_from_x(x, k, cdf, salt, singleton_limit=k)
     rhs = int(y)
 
     unknown: Set[int] = set()
@@ -182,7 +195,16 @@ def create_protocol(config: Config) -> Protocol:
 
     N = packet_bitsize
     z = N - 1  # symbol bits per packet (phase bit excluded)
-    q = 1 << z
+    symbol_q = 1 << z
+    symbol_mask = symbol_q - 1
+
+    input_bits = PREFIX * z
+    if input_bits > MAX_PREFIX_INPUT_BITS:
+        raise ValueError(
+            "phased_sparce_chain is tailored for small packet sizes: "
+            f"PREFIX*(packet_bitsize-1) must be <= {MAX_PREFIX_INPUT_BITS}, got {input_bits}"
+        )
+    state_q = 1 << input_bits
 
     max_bits = max_message_bitsize(packet_bitsize)
     if message_bitsize > max_bits:
@@ -202,158 +224,94 @@ def create_protocol(config: Config) -> Protocol:
     salt_a = 0x9E3779B97F4A7C15
     salt_b = 0xD1B54A32D192ED03
 
-    mask = q - 1
-
     def make_sampler(message: Message) -> Sampler:
         msg_a = message[:half_bits_a]
         msg_b = message[half_bits_a:]
 
         symbols_a = (
-            make_message_vector(msg_a, k1, q)
+            make_message_vector(msg_a, k1, symbol_q)
             if k1 > 0
             else np.empty(0, dtype=np.uint16)
         )
         symbols_b = (
-            make_message_vector(msg_b, k2, q)
+            make_message_vector(msg_b, k2, symbol_q)
             if k2 > 0
             else np.empty(0, dtype=np.uint16)
         )
 
-        def f1(x: np.uint16) -> np.uint16:
+        def f1(x: int) -> int:
             if k1 == 0:
-                return np.uint16(0)
+                return 0
             subset = _subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
             y = 0
             for idx in subset:
                 y ^= int(symbols_a[idx])
-            return np.uint16(y & mask)
+            return y & symbol_mask
 
-        def f2(x: np.uint16) -> np.uint16:
+        def f2(x: int) -> int:
             if k2 == 0:
-                return np.uint16(0)
+                return 0
             subset = _subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
             y = 0
             for idx in subset:
                 y ^= int(symbols_b[idx])
-            return np.uint16(y & mask)
+            return y & symbol_mask
 
-        nxt_a = np.empty(q, dtype=np.uint16)  # A -> B via f1
-        nxt_b = np.empty(q, dtype=np.uint16)  # B -> A via f2
-        for x in range(q):
-            xv = np.uint16(x)
-            nxt_a[x] = f1(xv)
-            nxt_b[x] = f2(xv)
+        def x_to_symbols(x: int) -> List[int]:
+            symbols = [0 for _ in range(PREFIX)]
+            curr = int(x)
+            for i in range(PREFIX - 1, -1, -1):
+                symbols[i] = curr & symbol_mask
+                curr >>= z
+            return symbols
 
-        alive_a = np.ones(q, dtype=np.bool_)
-        alive_b = np.ones(q, dtype=np.bool_)
+        def phased_output(symbol: int, is_phase_b: bool):
+            value = symbol + (symbol_q if is_phase_b else 0)
+            return uint16_to_bool_array(np.uint16(value), N)
 
-        def orbit_path(start: int, start_phase_b: bool):
-            seen: set[Tuple[bool, int]] = set()
-            path: list[Tuple[np.uint16, bool]] = []
-            cur = start
-            phase_b = start_phase_b
+        singleton_a = list(range(min(k1, state_q)))
+        singleton_b = list(range(min(k2, state_q)))
 
-            while True:
-                if phase_b:
-                    if (not alive_b[cur]) or ((phase_b, cur) in seen):
-                        return path, (np.uint16(cur), phase_b)
-                else:
-                    if (not alive_a[cur]) or ((phase_b, cur) in seen):
-                        return path, (np.uint16(cur), phase_b)
+        def emit_equation_segment(x: int, use_a: bool):
+            src_phase_b = not use_a  # use_a: A->B, else B->A
+            dst_phase_b = not src_phase_b
+            prefix_symbols = x_to_symbols(x)
+            y = f1(x) if use_a else f2(x)
 
-                seen.add((phase_b, cur))
-                path.append((np.uint16(cur), phase_b))
+            prefix_phases = [
+                bool(src_phase_b ^ ((PREFIX - 1 - i) & 1)) for i in range(PREFIX)
+            ]
+            seq_symbols = prefix_symbols + [y]
+            seq_phases = prefix_phases + [dst_phase_b]
 
-                if phase_b:
-                    cur = int(nxt_b[cur])
-                else:
-                    cur = int(nxt_a[cur])
-                phase_b = not phase_b
+            # Always force a local reset marker regardless of previous stream context.
+            first_symbol = seq_symbols[0]
+            first_phase_b = seq_phases[0]
+            yield phased_output(first_symbol, first_phase_b)
+            yield phased_output(first_symbol, first_phase_b)
 
-        paths: list[list[Tuple[np.uint16, bool]]] = []
-        total_k = k1 + k2
-        score = 0
-        q_total = 2 * q
-        target_score = min(max(100 * total_k, int(0.2 * q_total)), q_total)
+            for symbol, phase_b in zip(seq_symbols[1:], seq_phases[1:]):
+                yield phased_output(symbol, phase_b)
 
-        while score < target_score and (np.any(alive_a) or np.any(alive_b)):
-            best_path: list[Tuple[np.uint16, bool]] | None = None
-            best_terminal: Tuple[np.uint16, bool] = (np.uint16(0), False)
-            best_len = -1
-
-            for s in range(q):
-                if alive_a[s]:
-                    candidate_path, terminal = orbit_path(s, False)
-                    if len(candidate_path) > best_len:
-                        best_len = len(candidate_path)
-                        best_path = candidate_path
-                        best_terminal = terminal
-
-                if alive_b[s]:
-                    candidate_path, terminal = orbit_path(s, True)
-                    if len(candidate_path) > best_len:
-                        best_len = len(candidate_path)
-                        best_path = candidate_path
-                        best_terminal = terminal
-
-            if best_path is None or best_len <= 0:
-                break
-
-            emitted_path = best_path + [best_terminal]
-            paths.append(emitted_path)
-            score += len(emitted_path) - 1
-
-            for v, v_phase_b in best_path:
-                if v_phase_b:
-                    alive_b[int(v)] = False
-                else:
-                    alive_a[int(v)] = False
-
-        if not paths:
-            paths = [[(np.uint16(0), False), (np.uint16(0), False)]]
-
-        paths_by_start_phase = {
-            False: [p for p in paths if not p[0][1]],
-            True: [p for p in paths if p[0][1]],
-        }
-        phase_cursor = {False: 0, True: 0}
-
-        def next_path(required_start_phase_b: bool):
-            primary = paths_by_start_phase[required_start_phase_b]
-            if primary:
-                idx = phase_cursor[required_start_phase_b] % len(primary)
-                phase_cursor[required_start_phase_b] += 1
-                return primary[idx]
-
-            fallback_phase_b = not required_start_phase_b
-            fallback = paths_by_start_phase[fallback_phase_b]
-            if fallback:
-                idx = phase_cursor[fallback_phase_b] % len(fallback)
-                phase_cursor[fallback_phase_b] += 1
-                return fallback[idx]
-
-            return paths[0]
-
-        def phased_output(value: np.uint16, is_phase_b: bool):
-            return uint16_to_bool_array(
-                np.uint16(int(value) + (q if is_phase_b else 0)), N
-            )
-
-        required_start_phase_b = paths[0][0][1]
         while True:
-            path = next_path(required_start_phase_b)
-            for i, (state, state_phase_b) in enumerate(path):
-                if i > 0 and path[i - 1][1] == state_phase_b:
-                    raise RuntimeError(
-                        "Sampler path has non-alternating phase sequence"
-                    )
-                yield phased_output(state, state_phase_b)
-            required_start_phase_b = path[-1][1]
+            if k1 > 0:
+                for x in singleton_a:
+                    for packet in emit_equation_segment(x, use_a=True):
+                        yield packet
+            if k1 > 0 and k2 > 0:
+                # Bridge A->B with a same-phase reset (A segments end in phase B=True).
+                yield phased_output(0, True)
+            if k2 > 0:
+                for x in singleton_b:
+                    for packet in emit_equation_segment(x, use_a=False):
+                        yield packet
+            if k1 > 0 and k2 > 0:
+                # Bridge B->A with a same-phase reset (B segments end in phase B=False).
+                yield phased_output(0, False)
+            if k1 == 0 and k2 == 0:
+                yield phased_output(0, False)
 
     def make_estimator() -> Estimator:
-        x: int | None = None
-        prev_phase: bool | None = None
-
         symbols_a: List[int | None] = [None for _ in range(k1)]
         symbols_b: List[int | None] = [None for _ in range(k2)]
         pending_a: List[Tuple[Set[int], int]] = []
@@ -361,6 +319,10 @@ def create_protocol(config: Config) -> Protocol:
 
         seen_a: Dict[int, int] = {}
         seen_b: Dict[int, int] = {}
+
+        run_symbols: List[int] = []
+        run_phases: List[bool] = []
+        max_run_keep = PREFIX + 1
 
         total_k = k1 + k2
 
@@ -379,13 +341,13 @@ def create_protocol(config: Config) -> Protocol:
             parts = []
             if k1 > 0:
                 vec_a = np.array(symbols_a, dtype=np.uint16)
-                parts.append(message_from_message_vector(vec_a, half_bits_a, q))
+                parts.append(message_from_message_vector(vec_a, half_bits_a, symbol_q))
             else:
                 parts.append(np.zeros(0, dtype=np.bool_))
 
             if k2 > 0:
                 vec_b = np.array(symbols_b, dtype=np.uint16)
-                parts.append(message_from_message_vector(vec_b, half_bits_b, q))
+                parts.append(message_from_message_vector(vec_b, half_bits_b, symbol_q))
             else:
                 parts.append(np.zeros(0, dtype=np.bool_))
 
@@ -399,47 +361,45 @@ def create_protocol(config: Config) -> Protocol:
             packet = yield progress()
 
             if packet is None:
-                x = None
-                prev_phase = None
+                run_symbols.clear()
+                run_phases.clear()
                 continue
 
             curr_phase = bool(packet[0])
-            y = int(bool_array_to_uint16(packet) & mask)
+            curr_symbol = int(bool_array_to_uint16(packet) & symbol_mask)
 
-            if prev_phase is None:
-                prev_phase = not curr_phase
-
-            same_phase = curr_phase == prev_phase
-            prev_phase_value = prev_phase
-            prev_phase = curr_phase
-
-            if same_phase:
-                x = y
+            if run_phases and curr_phase == run_phases[-1]:
+                run_symbols[:] = [curr_symbol]
+                run_phases[:] = [curr_phase]
                 continue
 
-            if x is not None:
-                # A -> B gives equation over first half symbols.
-                if (not prev_phase_value) and curr_phase:
-                    if k1 > 0:
-                        old = seen_a.get(x)
-                        if old is None:
-                            seen_a[x] = y
-                            _peel_add_equation(
-                                x, y, k1, cdf_a, salt_a, symbols_a, pending_a
-                            )
-                            _peel_propagate(symbols_a, pending_a)
-                # B -> A gives equation over second half symbols.
-                elif prev_phase_value and (not curr_phase):
-                    if k2 > 0:
-                        old = seen_b.get(x)
-                        if old is None:
-                            seen_b[x] = y
-                            _peel_add_equation(
-                                x, y, k2, cdf_b, salt_b, symbols_b, pending_b
-                            )
-                            _peel_propagate(symbols_b, pending_b)
+            run_symbols.append(curr_symbol)
+            run_phases.append(curr_phase)
 
-            x = y
+            if len(run_symbols) > max_run_keep:
+                run_symbols[:] = run_symbols[-max_run_keep:]
+                run_phases[:] = run_phases[-max_run_keep:]
+
+            if len(run_symbols) < (PREFIX + 1):
+                continue
+
+            x = _pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
+            y = run_symbols[-1]
+            src_phase = run_phases[-2]
+            dst_phase = run_phases[-1]
+
+            # A -> B gives equation over first half symbols.
+            if (not src_phase) and dst_phase:
+                if k1 > 0 and x not in seen_a:
+                    seen_a[x] = y
+                    _peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
+                    _peel_propagate(symbols_a, pending_a)
+            # B -> A gives equation over second half symbols.
+            elif src_phase and (not dst_phase):
+                if k2 > 0 and x not in seen_b:
+                    seen_b[x] = y
+                    _peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
+                    _peel_propagate(symbols_b, pending_b)
 
     return Protocol(
         make_sampler=make_sampler,
@@ -451,7 +411,10 @@ def max_message_bitsize(packet_bitsize: int) -> int:
     if packet_bitsize <= 1:
         return 0
     z = packet_bitsize - 1
-    return 2 * z * (1 << z)
+    input_bits = PREFIX * z
+    if input_bits > MAX_PREFIX_INPUT_BITS:
+        return 0
+    return 2 * z * (1 << input_bits)
 
 
 def expected_packets_until_reconstructed(
