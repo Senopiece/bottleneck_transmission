@@ -10,9 +10,9 @@ from ._interface import Config, Estimator, Packet, Message, Protocol, Sampler
 # TODO: optimize computation with numba
 
 # Domain:
-# deletion_probability: [0, 1)
+# skip_probability: [0, 1)
 # corruption_probability: 0
-# deletion_observation: 0
+# skip_observation: 0
 
 # ---------------------------------------------------------------------------
 # Helper utilities shared by sampler and estimator

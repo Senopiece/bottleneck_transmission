@@ -16,9 +16,9 @@ from ._utils.intmath import (
 )
 
 # Domain:
-# deletion_probability: [0, 1)
+# skip_probability: [0, 1)
 # corruption_probability: 0
-# deletion_observation: 1.0
+# skip_observation: 1.0
 
 
 def create_protocol(config: Config) -> Protocol:

@@ -1,0 +1,462 @@
+import math
+import random
+from typing import Dict, List, Set, Tuple
+
+import numpy as np
+
+from ._interface import Config, Estimator, Message, Protocol, Sampler
+from ._utils.conversions import (
+    bool_array_to_uint16,
+    make_message_vector,
+    message_from_message_vector,
+    uint16_to_bool_array,
+)
+
+# Domain:
+# skip_probability: [0, 1)
+# corruption_probability: 0
+# skip_observation: 1.0
+
+
+def _robust_soliton_cdf(k: int, c: float = 0.1, delta: float = 0.05) -> List[float]:
+    if k <= 0:
+        return [1.0]
+
+    ideal = [0.0 for _ in range(k)]
+    ideal[0] = 1.0 / k
+    for d in range(2, k + 1):
+        ideal[d - 1] = 1.0 / (d * (d - 1))
+
+    R = c * math.log(k / delta) * math.sqrt(k)
+    if R < 1.0:
+        R = 1.0
+    k_over_R = max(1, int(math.floor(k / R)))
+
+    tau = [0.0 for _ in range(k)]
+    for d in range(1, k + 1):
+        if d < k_over_R:
+            tau[d - 1] = R / (d * k)
+        elif d == k_over_R:
+            tau[d - 1] = R * math.log(R / delta) / k
+
+    normalizer = sum(ideal[i] + tau[i] for i in range(k))
+    probs = [(ideal[i] + tau[i]) / normalizer for i in range(k)]
+
+    # Small-k tuning: force a stronger singleton ripple for tiny packets.
+    if k <= 16:
+        target_p1 = 0.35 if k <= 8 else 0.25
+        p1 = probs[0]
+        if p1 < target_p1:
+            rest_sum = max(1e-12, 1.0 - p1)
+            scale = (1.0 - target_p1) / rest_sum
+            probs[0] = target_p1
+            for i in range(1, k):
+                probs[i] *= scale
+
+    cdf: List[float] = []
+    acc = 0.0
+    for p in probs:
+        acc += p
+        cdf.append(acc)
+    cdf[-1] = 1.0
+    return cdf
+
+
+def _subset_from_x(
+    x: np.uint16,
+    k: int,
+    cdf: List[float],
+    salt: int,
+    singleton_limit: int,
+) -> List[int]:
+    if k <= 0:
+        return []
+
+    xi = int(x)
+    limit = max(0, min(singleton_limit, k))
+    if limit > 0 and xi < limit:
+        return [xi]
+
+    rng = random.Random((xi ^ salt) & 0xFFFFFFFFFFFFFFFF)
+    draw = rng.random()
+
+    degree = 1
+    for i, threshold in enumerate(cdf):
+        if draw <= threshold:
+            degree = i + 1
+            break
+
+    degree = max(1, min(degree, k))
+    if degree == k:
+        return list(range(k))
+
+    subset = rng.sample(range(k), degree)
+    subset.sort()
+    return subset
+
+
+def _peel_add_equation(
+    x: int,
+    y: int,
+    k: int,
+    cdf: List[float],
+    salt: int,
+    symbols: List[int | None],
+    pending: List[Tuple[Set[int], int]],
+) -> bool:
+    if k <= 0:
+        return False
+
+    subset = _subset_from_x(np.uint16(x), k, cdf, salt, singleton_limit=k)
+    rhs = int(y)
+
+    unknown: Set[int] = set()
+    for idx in subset:
+        known = symbols[idx]
+        if known is None:
+            unknown.add(idx)
+        else:
+            rhs ^= known
+
+    if not unknown:
+        return False
+
+    changed = False
+    if len(unknown) == 1:
+        idx = next(iter(unknown))
+        if symbols[idx] is None:
+            symbols[idx] = rhs
+            changed = True
+        return changed
+
+    pending.append((unknown, rhs))
+    return changed
+
+
+def _peel_propagate(
+    symbols: List[int | None], pending: List[Tuple[Set[int], int]]
+) -> bool:
+    changed_any = False
+
+    progressed = True
+    while progressed:
+        progressed = False
+        next_pending: List[Tuple[Set[int], int]] = []
+
+        for unknown, rhs in pending:
+            curr_unknown = set(unknown)
+            curr_rhs = int(rhs)
+
+            for idx in list(curr_unknown):
+                known = symbols[idx]
+                if known is not None:
+                    curr_rhs ^= known
+                    curr_unknown.remove(idx)
+
+            if not curr_unknown:
+                continue
+
+            if len(curr_unknown) == 1:
+                idx = next(iter(curr_unknown))
+                if symbols[idx] is None:
+                    symbols[idx] = curr_rhs
+                    progressed = True
+                    changed_any = True
+                continue
+
+            next_pending.append((curr_unknown, curr_rhs))
+
+        pending[:] = next_pending
+
+    return changed_any
+
+
+def create_protocol(config: Config) -> Protocol:
+    packet_bitsize = int(config.packet_bitsize)
+    message_bitsize = int(config.message_bitsize)
+
+    if packet_bitsize <= 1:
+        raise ValueError("packet_bitsize must be >= 2 to reserve a phase bit")
+    if message_bitsize < 0:
+        raise ValueError("message_bitsize must be >= 0")
+
+    N = packet_bitsize
+    z = N - 1  # symbol bits per packet (phase bit excluded)
+    q = 1 << z
+
+    max_bits = max_message_bitsize(packet_bitsize)
+    if message_bitsize > max_bits:
+        raise ValueError(
+            f"message_bitsize too large for phased_sparce_chain: max {max_bits} for packet_bitsize={packet_bitsize}"
+        )
+
+    half_bits_a = (message_bitsize + 1) // 2
+    half_bits_b = message_bitsize - half_bits_a
+
+    k1 = math.ceil(half_bits_a / z) if half_bits_a > 0 else 0
+    k2 = math.ceil(half_bits_b / z) if half_bits_b > 0 else 0
+
+    cdf_a = _robust_soliton_cdf(k1) if k1 > 0 else [1.0]
+    cdf_b = _robust_soliton_cdf(k2) if k2 > 0 else [1.0]
+
+    salt_a = 0x9E3779B97F4A7C15
+    salt_b = 0xD1B54A32D192ED03
+
+    mask = q - 1
+
+    def make_sampler(message: Message) -> Sampler:
+        msg_a = message[:half_bits_a]
+        msg_b = message[half_bits_a:]
+
+        symbols_a = (
+            make_message_vector(msg_a, k1, q)
+            if k1 > 0
+            else np.empty(0, dtype=np.uint16)
+        )
+        symbols_b = (
+            make_message_vector(msg_b, k2, q)
+            if k2 > 0
+            else np.empty(0, dtype=np.uint16)
+        )
+
+        def f1(x: np.uint16) -> np.uint16:
+            if k1 == 0:
+                return np.uint16(0)
+            subset = _subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
+            y = 0
+            for idx in subset:
+                y ^= int(symbols_a[idx])
+            return np.uint16(y & mask)
+
+        def f2(x: np.uint16) -> np.uint16:
+            if k2 == 0:
+                return np.uint16(0)
+            subset = _subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
+            y = 0
+            for idx in subset:
+                y ^= int(symbols_b[idx])
+            return np.uint16(y & mask)
+
+        nxt_a = np.empty(q, dtype=np.uint16)  # A -> B via f1
+        nxt_b = np.empty(q, dtype=np.uint16)  # B -> A via f2
+        for x in range(q):
+            xv = np.uint16(x)
+            nxt_a[x] = f1(xv)
+            nxt_b[x] = f2(xv)
+
+        alive_a = np.ones(q, dtype=np.bool_)
+        alive_b = np.ones(q, dtype=np.bool_)
+
+        def orbit_path(start: int, start_phase_b: bool):
+            seen: set[Tuple[bool, int]] = set()
+            path: list[Tuple[np.uint16, bool]] = []
+            cur = start
+            phase_b = start_phase_b
+
+            while True:
+                if phase_b:
+                    if (not alive_b[cur]) or ((phase_b, cur) in seen):
+                        return path, (np.uint16(cur), phase_b)
+                else:
+                    if (not alive_a[cur]) or ((phase_b, cur) in seen):
+                        return path, (np.uint16(cur), phase_b)
+
+                seen.add((phase_b, cur))
+                path.append((np.uint16(cur), phase_b))
+
+                if phase_b:
+                    cur = int(nxt_b[cur])
+                else:
+                    cur = int(nxt_a[cur])
+                phase_b = not phase_b
+
+        paths: list[list[Tuple[np.uint16, bool]]] = []
+        total_k = k1 + k2
+        score = 0
+        q_total = 2 * q
+        target_score = min(max(100 * total_k, int(0.2 * q_total)), q_total)
+
+        while score < target_score and (np.any(alive_a) or np.any(alive_b)):
+            best_path: list[Tuple[np.uint16, bool]] | None = None
+            best_terminal: Tuple[np.uint16, bool] = (np.uint16(0), False)
+            best_len = -1
+
+            for s in range(q):
+                if alive_a[s]:
+                    candidate_path, terminal = orbit_path(s, False)
+                    if len(candidate_path) > best_len:
+                        best_len = len(candidate_path)
+                        best_path = candidate_path
+                        best_terminal = terminal
+
+                if alive_b[s]:
+                    candidate_path, terminal = orbit_path(s, True)
+                    if len(candidate_path) > best_len:
+                        best_len = len(candidate_path)
+                        best_path = candidate_path
+                        best_terminal = terminal
+
+            if best_path is None or best_len <= 0:
+                break
+
+            emitted_path = best_path + [best_terminal]
+            paths.append(emitted_path)
+            score += len(emitted_path) - 1
+
+            for v, v_phase_b in best_path:
+                if v_phase_b:
+                    alive_b[int(v)] = False
+                else:
+                    alive_a[int(v)] = False
+
+        if not paths:
+            paths = [[(np.uint16(0), False), (np.uint16(0), False)]]
+
+        paths_by_start_phase = {
+            False: [p for p in paths if not p[0][1]],
+            True: [p for p in paths if p[0][1]],
+        }
+        phase_cursor = {False: 0, True: 0}
+
+        def next_path(required_start_phase_b: bool):
+            primary = paths_by_start_phase[required_start_phase_b]
+            if primary:
+                idx = phase_cursor[required_start_phase_b] % len(primary)
+                phase_cursor[required_start_phase_b] += 1
+                return primary[idx]
+
+            fallback_phase_b = not required_start_phase_b
+            fallback = paths_by_start_phase[fallback_phase_b]
+            if fallback:
+                idx = phase_cursor[fallback_phase_b] % len(fallback)
+                phase_cursor[fallback_phase_b] += 1
+                return fallback[idx]
+
+            return paths[0]
+
+        def phased_output(value: np.uint16, is_phase_b: bool):
+            return uint16_to_bool_array(
+                np.uint16(int(value) + (q if is_phase_b else 0)), N
+            )
+
+        required_start_phase_b = paths[0][0][1]
+        while True:
+            path = next_path(required_start_phase_b)
+            for i, (state, state_phase_b) in enumerate(path):
+                if i > 0 and path[i - 1][1] == state_phase_b:
+                    raise RuntimeError(
+                        "Sampler path has non-alternating phase sequence"
+                    )
+                yield phased_output(state, state_phase_b)
+            required_start_phase_b = path[-1][1]
+
+    def make_estimator() -> Estimator:
+        x: int | None = None
+        prev_phase: bool | None = None
+
+        symbols_a: List[int | None] = [None for _ in range(k1)]
+        symbols_b: List[int | None] = [None for _ in range(k2)]
+        pending_a: List[Tuple[Set[int], int]] = []
+        pending_b: List[Tuple[Set[int], int]] = []
+
+        seen_a: Dict[int, int] = {}
+        seen_b: Dict[int, int] = {}
+
+        total_k = k1 + k2
+
+        def progress() -> float:
+            if total_k == 0:
+                return 1.0
+            known = sum(1 for v in symbols_a if v is not None) + sum(
+                1 for v in symbols_b if v is not None
+            )
+            return known / total_k
+
+        def maybe_done() -> np.ndarray | None:
+            if any(v is None for v in symbols_a) or any(v is None for v in symbols_b):
+                return None
+
+            parts = []
+            if k1 > 0:
+                vec_a = np.array(symbols_a, dtype=np.uint16)
+                parts.append(message_from_message_vector(vec_a, half_bits_a, q))
+            else:
+                parts.append(np.zeros(0, dtype=np.bool_))
+
+            if k2 > 0:
+                vec_b = np.array(symbols_b, dtype=np.uint16)
+                parts.append(message_from_message_vector(vec_b, half_bits_b, q))
+            else:
+                parts.append(np.zeros(0, dtype=np.bool_))
+
+            return np.concatenate(parts)
+
+        while True:
+            done = maybe_done()
+            if done is not None:
+                return done
+
+            packet = yield progress()
+
+            if packet is None:
+                x = None
+                prev_phase = None
+                continue
+
+            curr_phase = bool(packet[0])
+            y = int(bool_array_to_uint16(packet) & mask)
+
+            if prev_phase is None:
+                prev_phase = not curr_phase
+
+            same_phase = curr_phase == prev_phase
+            prev_phase_value = prev_phase
+            prev_phase = curr_phase
+
+            if same_phase:
+                x = y
+                continue
+
+            if x is not None:
+                # A -> B gives equation over first half symbols.
+                if (not prev_phase_value) and curr_phase:
+                    if k1 > 0:
+                        old = seen_a.get(x)
+                        if old is None:
+                            seen_a[x] = y
+                            _peel_add_equation(
+                                x, y, k1, cdf_a, salt_a, symbols_a, pending_a
+                            )
+                            _peel_propagate(symbols_a, pending_a)
+                # B -> A gives equation over second half symbols.
+                elif prev_phase_value and (not curr_phase):
+                    if k2 > 0:
+                        old = seen_b.get(x)
+                        if old is None:
+                            seen_b[x] = y
+                            _peel_add_equation(
+                                x, y, k2, cdf_b, salt_b, symbols_b, pending_b
+                            )
+                            _peel_propagate(symbols_b, pending_b)
+
+            x = y
+
+    return Protocol(
+        make_sampler=make_sampler,
+        make_estimator=make_estimator,
+    )
+
+
+def max_message_bitsize(packet_bitsize: int) -> int:
+    if packet_bitsize <= 1:
+        return 0
+    z = packet_bitsize - 1
+    return 2 * z * (1 << z)
+
+
+def expected_packets_until_reconstructed(
+    gilbert_eliott_k: Tuple[float, float, float, float],  # pGB, pBG, pG, pB
+    packet_bitsize: int,
+    message_bitsize: int,
+):
+    return None
