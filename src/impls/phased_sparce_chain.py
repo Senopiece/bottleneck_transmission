@@ -13,9 +13,9 @@ from ._utils.conversions import (
 )
 
 # Domain:
-# deletion_probability: [0, 1)
+# skip_probability: [0, 1)
 # corruption_probability: 0
-# deletion_observation: 1.0
+# skip_observation: 1.0
 
 # Number of previous (n-1)-bit symbols packed into x for f(x).
 PREFIX = 1
