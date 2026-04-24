@@ -221,6 +221,7 @@ def create_protocol(config: Config) -> Protocol:
     cdf_a = _robust_soliton_cdf(k1) if k1 > 0 else [1.0]
     cdf_b = _robust_soliton_cdf(k2) if k2 > 0 else [1.0]
 
+    # TODO: for small packet sizes it may be beneficial to check several salts and pick the best among N candidates
     salt_a = 0x9E3779B97F4A7C15
     salt_b = 0xD1B54A32D192ED03
 
