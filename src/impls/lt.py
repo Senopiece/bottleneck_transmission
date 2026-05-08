@@ -6,6 +6,7 @@ from typing import Dict, Iterable, Tuple
 import numpy as np
 
 from ._interface import Config, Estimator, Packet, Message, Protocol, Sampler
+from ._utils.sparce import robust_soliton_cdf
 
 # TODO: optimize computation with numba
 
@@ -79,40 +80,6 @@ def _select_layout(n: int, message_bitsize: int) -> _SchemeLayout:
             f"Cannot encode payload of {message_bitsize} bits with packets of width {n}"
         )
     return best_layout
-
-
-def _robust_soliton_cdf(k: int, c: float = 0.1, delta: float = 0.05) -> list[float]:
-    """Robust soliton distribution (cumulative) used to sample degrees."""
-    if k <= 0:
-        return [1.0]
-
-    ideal = [0.0 for _ in range(k)]
-    ideal[0] = 1.0 / k
-    for d in range(2, k + 1):
-        ideal[d - 1] = 1.0 / (d * (d - 1))
-
-    R = c * math.log(k / delta) * math.sqrt(k)
-    if R < 1.0:
-        R = 1.0
-    k_over_R = max(1, int(math.floor(k / R)))
-
-    tau = [0.0 for _ in range(k)]
-    for d in range(1, k + 1):
-        if d < k_over_R:
-            tau[d - 1] = R / (d * k)
-        elif d == k_over_R:
-            tau[d - 1] = R * math.log(R / delta) / k
-
-    normalizer = sum(ideal[i] + tau[i] for i in range(k))
-    probs = [(ideal[i] + tau[i]) / normalizer for i in range(k)]
-
-    cdf = []
-    acc = 0.0
-    for p in probs:
-        acc += p
-        cdf.append(acc)
-    cdf[-1] = 1.0  # ensure numerical stability
-    return cdf
 
 
 def _subset_from_seed(
@@ -214,7 +181,7 @@ class _LTSamplerState:
         self.symbol_bits = layout.symbol_bits
         self.k = layout.k
 
-        self.degree_cdf = _robust_soliton_cdf(self.k)
+        self.degree_cdf = robust_soliton_cdf(self.k)
         message_bitsize_arr = _normalize_payload(payload, message_bitsize)
         payload_seed = _bits_to_int(message_bitsize_arr)
         self.source_symbols = _message_bitsize_to_symbols(
@@ -271,7 +238,7 @@ class _LTEstimatorState:
         self.header_bits = layout.header_bits
         self.symbol_bits = layout.symbol_bits
         self.k = layout.k
-        self.degree_cdf = _robust_soliton_cdf(self.k)
+        self.degree_cdf = robust_soliton_cdf(self.k)
 
         self.symbols: list[np.ndarray | None] = [None for _ in range(self.k)]
         self.pending: list[tuple[set[int], np.ndarray]] = []

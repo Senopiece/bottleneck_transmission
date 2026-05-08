@@ -11,14 +11,13 @@ from ._utils.conversions import (
     message_from_message_vector,
     uint16_to_bool_array,
 )
-from .phased_sparce_chain import (
+from ._utils.sparce import (
     MAX_PREFIX_INPUT_BITS,
-    PREFIX,
-    _pack_prefix_symbols,
-    _peel_add_equation,
-    _peel_propagate,
-    _robust_soliton_cdf,
-    _subset_from_x,
+    pack_prefix_symbols,
+    peel_add_equation,
+    peel_propagate,
+    robust_soliton_cdf,
+    subset_from_x,
 )
 
 # Domain:
@@ -27,6 +26,9 @@ from .phased_sparce_chain import (
 # skip_observation: 1.0
 
 SEGMENT_PROBES = 4
+
+# Number of previous (n-1)-bit symbols packed into x for f(x).
+PREFIX = 1
 
 
 def sampler_seed(
@@ -88,8 +90,8 @@ def create_protocol(config: Config) -> Protocol:
     k1 = math.ceil(half_bits_a / z) if half_bits_a > 0 else 0
     k2 = math.ceil(half_bits_b / z) if half_bits_b > 0 else 0
 
-    cdf_a = _robust_soliton_cdf(k1) if k1 > 0 else [1.0]
-    cdf_b = _robust_soliton_cdf(k2) if k2 > 0 else [1.0]
+    cdf_a = robust_soliton_cdf(k1) if k1 > 0 else [1.0]
+    cdf_b = robust_soliton_cdf(k2) if k2 > 0 else [1.0]
 
     salt_a = 0x9E3779B97F4A7C15
     salt_b = 0xD1B54A32D192ED03
@@ -112,7 +114,7 @@ def create_protocol(config: Config) -> Protocol:
         def f1(x: int) -> int:
             if k1 == 0:
                 return 0
-            subset = _subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
+            subset = subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
             y = 0
             for idx in subset:
                 y ^= int(symbols_a[idx])
@@ -121,7 +123,7 @@ def create_protocol(config: Config) -> Protocol:
         def f2(x: int) -> int:
             if k2 == 0:
                 return 0
-            subset = _subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
+            subset = subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
             y = 0
             for idx in subset:
                 y ^= int(symbols_b[idx])
@@ -347,7 +349,7 @@ def create_protocol(config: Config) -> Protocol:
             if len(run_symbols) < (PREFIX + 1):
                 continue
 
-            x = _pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
+            x = pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
             y = run_symbols[-1]
             src_phase = run_phases[-2]
             dst_phase = run_phases[-1]
@@ -355,13 +357,13 @@ def create_protocol(config: Config) -> Protocol:
             if (not src_phase) and dst_phase:
                 if k1 > 0 and x not in seen_a:
                     seen_a[x] = y
-                    _peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
-                    _peel_propagate(symbols_a, pending_a)
+                    peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
+                    peel_propagate(symbols_a, pending_a)
             elif src_phase and (not dst_phase):
                 if k2 > 0 and x not in seen_b:
                     seen_b[x] = y
-                    _peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
-                    _peel_propagate(symbols_b, pending_b)
+                    peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
+                    peel_propagate(symbols_b, pending_b)
 
     return Protocol(
         make_sampler=make_sampler,

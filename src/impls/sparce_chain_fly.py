@@ -11,11 +11,11 @@ from ._utils.conversions import (
     int_to_bits,
     uint16_to_bool_array,
 )
-from .phased_sparce_chain import (
-    _peel_add_equation,
-    _peel_propagate,
-    _robust_soliton_cdf,
-    _subset_from_x,
+from ._utils.sparce import (
+    peel_add_equation,
+    peel_propagate,
+    robust_soliton_cdf,
+    subset_from_x,
 )
 
 # Domain:
@@ -107,7 +107,7 @@ def _eval_sparse_coefficients(
     cdf: List[float],
     salt: int,
 ) -> int:
-    subset = _subset_from_x(
+    subset = subset_from_x(
         x, len(coefficients), cdf, salt, singleton_limit=len(coefficients)
     )
     y = 0
@@ -132,8 +132,8 @@ def _solve_coefficients_from_agreed_y(
     pending: List[Tuple[Set[int], int]] = []
 
     for x, y in zip(agreed_xs, y_columns):
-        _peel_add_equation(int(x), int(y), m, cdf, salt, symbols, pending)
-        _peel_propagate(symbols, pending)
+        peel_add_equation(int(x), int(y), m, cdf, salt, symbols, pending)
+        peel_propagate(symbols, pending)
 
     if any(v is None for v in symbols):
         raise RuntimeError("agreed sparse system is not peel-solvable")
@@ -174,7 +174,7 @@ def create_protocol(config: Config) -> Protocol:
     N = packet_bitsize
     delimiter = (1 << N) - 1
     m = raw_blocks + 1
-    cdf = _robust_soliton_cdf(m)
+    cdf = robust_soliton_cdf(m)
     agreed_xs = _select_agreed_xs(m)
 
     max_bits = max_message_bitsize(packet_bitsize)
@@ -282,8 +282,8 @@ def create_protocol(config: Config) -> Protocol:
             y = int(bool_array_to_uint16(packet))
             if x is not None and x not in seen_x:
                 seen_x.add(x)
-                _peel_add_equation(x, y, m, cdf, SALT, coefficients, pending)
-                _peel_propagate(coefficients, pending)
+                peel_add_equation(x, y, m, cdf, SALT, coefficients, pending)
+                peel_propagate(coefficients, pending)
             x = y
 
         coeff_array = np.array(coefficients, dtype=np.uint16)

@@ -1,5 +1,4 @@
 import math
-import random
 from typing import Dict, List, Set, Tuple
 
 import numpy as np
@@ -11,6 +10,14 @@ from ._utils.conversions import (
     message_from_message_vector,
     uint16_to_bool_array,
 )
+from ._utils.sparce import (
+    MAX_PREFIX_INPUT_BITS,
+    pack_prefix_symbols,
+    peel_add_equation,
+    peel_propagate,
+    robust_soliton_cdf,
+    subset_from_x,
+)
 
 # Domain:
 # skip_probability: [0, 1)
@@ -19,169 +26,6 @@ from ._utils.conversions import (
 
 # Number of previous (n-1)-bit symbols packed into x for f(x).
 PREFIX = 1
-
-# Keep state-space bounded; this implementation is tailored for small packet sizes.
-MAX_PREFIX_INPUT_BITS = 16
-
-
-def _robust_soliton_cdf(k: int, c: float = 0.1, delta: float = 0.05) -> List[float]:
-    if k <= 0:
-        return [1.0]
-
-    ideal = [0.0 for _ in range(k)]
-    ideal[0] = 1.0 / k
-    for d in range(2, k + 1):
-        ideal[d - 1] = 1.0 / (d * (d - 1))
-
-    R = c * math.log(k / delta) * math.sqrt(k)
-    if R < 1.0:
-        R = 1.0
-    k_over_R = max(1, int(math.floor(k / R)))
-
-    tau = [0.0 for _ in range(k)]
-    for d in range(1, k + 1):
-        if d < k_over_R:
-            tau[d - 1] = R / (d * k)
-        elif d == k_over_R:
-            tau[d - 1] = R * math.log(R / delta) / k
-
-    normalizer = sum(ideal[i] + tau[i] for i in range(k))
-    probs = [(ideal[i] + tau[i]) / normalizer for i in range(k)]
-
-    # Small-k tuning: force a stronger singleton ripple for tiny packets.
-    if k <= 16:
-        target_p1 = 0.35 if k <= 8 else 0.25
-        p1 = probs[0]
-        if p1 < target_p1:
-            rest_sum = max(1e-12, 1.0 - p1)
-            scale = (1.0 - target_p1) / rest_sum
-            probs[0] = target_p1
-            for i in range(1, k):
-                probs[i] *= scale
-
-    cdf: List[float] = []
-    acc = 0.0
-    for p in probs:
-        acc += p
-        cdf.append(acc)
-    cdf[-1] = 1.0
-    return cdf
-
-
-def _subset_from_x(
-    x: int,
-    k: int,
-    cdf: List[float],
-    salt: int,
-    singleton_limit: int,
-) -> List[int]:
-    if k <= 0:
-        return []
-
-    xi = int(x)
-    limit = max(0, min(singleton_limit, k))
-    if limit > 0 and xi < limit:
-        return [xi]
-
-    rng = random.Random((xi ^ salt) & 0xFFFFFFFFFFFFFFFF)
-    draw = rng.random()
-
-    degree = 1
-    for i, threshold in enumerate(cdf):
-        if draw <= threshold:
-            degree = i + 1
-            break
-
-    degree = max(1, min(degree, k))
-    if degree == k:
-        return list(range(k))
-
-    subset = rng.sample(range(k), degree)
-    subset.sort()
-    return subset
-
-
-def _pack_prefix_symbols(symbols: List[int], z: int) -> int:
-    x = 0
-    for symbol in symbols:
-        x = (x << z) | int(symbol)
-    return x
-
-
-def _peel_add_equation(
-    x: int,
-    y: int,
-    k: int,
-    cdf: List[float],
-    salt: int,
-    symbols: List[int | None],
-    pending: List[Tuple[Set[int], int]],
-) -> bool:
-    if k <= 0:
-        return False
-
-    subset = _subset_from_x(x, k, cdf, salt, singleton_limit=k)
-    rhs = int(y)
-
-    unknown: Set[int] = set()
-    for idx in subset:
-        known = symbols[idx]
-        if known is None:
-            unknown.add(idx)
-        else:
-            rhs ^= known
-
-    if not unknown:
-        return False
-
-    changed = False
-    if len(unknown) == 1:
-        idx = next(iter(unknown))
-        if symbols[idx] is None:
-            symbols[idx] = rhs
-            changed = True
-        return changed
-
-    pending.append((unknown, rhs))
-    return changed
-
-
-def _peel_propagate(
-    symbols: List[int | None], pending: List[Tuple[Set[int], int]]
-) -> bool:
-    changed_any = False
-
-    progressed = True
-    while progressed:
-        progressed = False
-        next_pending: List[Tuple[Set[int], int]] = []
-
-        for unknown, rhs in pending:
-            curr_unknown = set(unknown)
-            curr_rhs = int(rhs)
-
-            for idx in list(curr_unknown):
-                known = symbols[idx]
-                if known is not None:
-                    curr_rhs ^= known
-                    curr_unknown.remove(idx)
-
-            if not curr_unknown:
-                continue
-
-            if len(curr_unknown) == 1:
-                idx = next(iter(curr_unknown))
-                if symbols[idx] is None:
-                    symbols[idx] = curr_rhs
-                    progressed = True
-                    changed_any = True
-                continue
-
-            next_pending.append((curr_unknown, curr_rhs))
-
-        pending[:] = next_pending
-
-    return changed_any
 
 
 def create_protocol(config: Config) -> Protocol:
@@ -218,8 +62,8 @@ def create_protocol(config: Config) -> Protocol:
     k1 = math.ceil(half_bits_a / z) if half_bits_a > 0 else 0
     k2 = math.ceil(half_bits_b / z) if half_bits_b > 0 else 0
 
-    cdf_a = _robust_soliton_cdf(k1) if k1 > 0 else [1.0]
-    cdf_b = _robust_soliton_cdf(k2) if k2 > 0 else [1.0]
+    cdf_a = robust_soliton_cdf(k1) if k1 > 0 else [1.0]
+    cdf_b = robust_soliton_cdf(k2) if k2 > 0 else [1.0]
 
     # TODO: for small packet sizes it may be beneficial to check several salts and pick the best among N candidates
     salt_a = 0x9E3779B97F4A7C15
@@ -243,7 +87,7 @@ def create_protocol(config: Config) -> Protocol:
         def f1(x: int) -> int:
             if k1 == 0:
                 return 0
-            subset = _subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
+            subset = subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
             y = 0
             for idx in subset:
                 y ^= int(symbols_a[idx])
@@ -252,7 +96,7 @@ def create_protocol(config: Config) -> Protocol:
         def f2(x: int) -> int:
             if k2 == 0:
                 return 0
-            subset = _subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
+            subset = subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
             y = 0
             for idx in subset:
                 y ^= int(symbols_b[idx])
@@ -379,13 +223,13 @@ def create_protocol(config: Config) -> Protocol:
             if (not src_phase) and dst_phase:
                 if k1 > 0 and x not in seen_a:
                     seen_a[x] = y
-                    _peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
-                    _peel_propagate(symbols_a, pending_a)
+                    peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
+                    peel_propagate(symbols_a, pending_a)
             elif src_phase and (not dst_phase):
                 if k2 > 0 and x not in seen_b:
                     seen_b[x] = y
-                    _peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
-                    _peel_propagate(symbols_b, pending_b)
+                    peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
+                    peel_propagate(symbols_b, pending_b)
 
         while True:
             done = maybe_done()
@@ -426,7 +270,7 @@ def create_protocol(config: Config) -> Protocol:
 
             commit_pending_edge()
 
-            x = _pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
+            x = pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
             y = run_symbols[-1]
             src_phase = run_phases[-2]
             dst_phase = run_phases[-1]
