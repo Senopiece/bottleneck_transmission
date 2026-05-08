@@ -272,6 +272,19 @@ def create_protocol(config: Config) -> Protocol:
 
         singleton_a = list(range(min(k1, state_q)))
         singleton_b = list(range(min(k2, state_q)))
+        last_output: List[Tuple[int, bool] | None] = [None]
+
+        def make_output(symbol: int, is_phase_b: bool):
+            symbol = int(symbol) & symbol_mask
+            last_output[0] = (symbol, is_phase_b)
+            return phased_output(symbol, is_phase_b)
+
+        def bridge_output(is_phase_b: bool):
+            symbol = 0
+            last = last_output[0]
+            if last is not None and last == (symbol, is_phase_b):
+                symbol = 1 if symbol_q > 1 else 0
+            return make_output(symbol, is_phase_b)
 
         def emit_equation_segment(x: int, use_a: bool):
             src_phase_b = not use_a  # use_a: A->B, else B->A
@@ -288,11 +301,11 @@ def create_protocol(config: Config) -> Protocol:
             # Always force a local reset marker regardless of previous stream context.
             first_symbol = seq_symbols[0]
             first_phase_b = seq_phases[0]
-            yield phased_output(first_symbol, first_phase_b)
-            yield phased_output(first_symbol, first_phase_b)
+            yield make_output(first_symbol, first_phase_b)
+            yield make_output(first_symbol, first_phase_b)
 
             for symbol, phase_b in zip(seq_symbols[1:], seq_phases[1:]):
-                yield phased_output(symbol, phase_b)
+                yield make_output(symbol, phase_b)
 
         while True:
             if k1 > 0:
@@ -301,16 +314,16 @@ def create_protocol(config: Config) -> Protocol:
                         yield packet
             if k1 > 0 and k2 > 0:
                 # Bridge A->B with a same-phase reset (A segments end in phase B=True).
-                yield phased_output(0, True)
+                yield bridge_output(True)
             if k2 > 0:
                 for x in singleton_b:
                     for packet in emit_equation_segment(x, use_a=False):
                         yield packet
             if k1 > 0 and k2 > 0:
                 # Bridge B->A with a same-phase reset (B segments end in phase B=False).
-                yield phased_output(0, False)
+                yield bridge_output(False)
             if k1 == 0 and k2 == 0:
-                yield phased_output(0, False)
+                yield make_output(0, False)
 
     def make_estimator() -> Estimator:
         symbols_a: List[int | None] = [None for _ in range(k1)]
@@ -324,6 +337,7 @@ def create_protocol(config: Config) -> Protocol:
         run_symbols: List[int] = []
         run_phases: List[bool] = []
         max_run_keep = PREFIX + 1
+        pending_edge: Tuple[int, int, bool, bool] | None = None
 
         total_k = k1 + k2
 
@@ -354,6 +368,25 @@ def create_protocol(config: Config) -> Protocol:
 
             return np.concatenate(parts)
 
+        def commit_pending_edge() -> None:
+            nonlocal pending_edge
+            if pending_edge is None:
+                return
+
+            x, y, src_phase, dst_phase = pending_edge
+            pending_edge = None
+
+            if (not src_phase) and dst_phase:
+                if k1 > 0 and x not in seen_a:
+                    seen_a[x] = y
+                    _peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
+                    _peel_propagate(symbols_a, pending_a)
+            elif src_phase and (not dst_phase):
+                if k2 > 0 and x not in seen_b:
+                    seen_b[x] = y
+                    _peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
+                    _peel_propagate(symbols_b, pending_b)
+
         while True:
             done = maybe_done()
             if done is not None:
@@ -362,6 +395,7 @@ def create_protocol(config: Config) -> Protocol:
             packet = yield progress()
 
             if packet is None:
+                pending_edge = None
                 run_symbols.clear()
                 run_phases.clear()
                 continue
@@ -370,6 +404,12 @@ def create_protocol(config: Config) -> Protocol:
             curr_symbol = int(bool_array_to_uint16(packet) & symbol_mask)
 
             if run_phases and curr_phase == run_phases[-1]:
+                is_duplicate_reset = curr_symbol == run_symbols[-1]
+                if pending_edge is not None:
+                    if is_duplicate_reset:
+                        pending_edge = None
+                    else:
+                        commit_pending_edge()
                 run_symbols[:] = [curr_symbol]
                 run_phases[:] = [curr_phase]
                 continue
@@ -384,23 +424,14 @@ def create_protocol(config: Config) -> Protocol:
             if len(run_symbols) < (PREFIX + 1):
                 continue
 
+            commit_pending_edge()
+
             x = _pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
             y = run_symbols[-1]
             src_phase = run_phases[-2]
             dst_phase = run_phases[-1]
 
-            # A -> B gives equation over first half symbols.
-            if (not src_phase) and dst_phase:
-                if k1 > 0 and x not in seen_a:
-                    seen_a[x] = y
-                    _peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
-                    _peel_propagate(symbols_a, pending_a)
-            # B -> A gives equation over second half symbols.
-            elif src_phase and (not dst_phase):
-                if k2 > 0 and x not in seen_b:
-                    seen_b[x] = y
-                    _peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
-                    _peel_propagate(symbols_b, pending_b)
+            pending_edge = (x, y, src_phase, dst_phase)
 
     return Protocol(
         make_sampler=make_sampler,

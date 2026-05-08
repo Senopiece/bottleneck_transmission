@@ -304,7 +304,7 @@ def create_protocol(config: Config) -> Protocol:
 
 def max_message_bitsize(packet_bitsize: int) -> int:
     zn = packet_bitsize - 1
-    return zn * (1 << packet_bitsize)
+    return zn * (1 << packet_bitsize) - 30  # TODO: remove this -30
 
 
 def expected_packets_until_reconstructed(
