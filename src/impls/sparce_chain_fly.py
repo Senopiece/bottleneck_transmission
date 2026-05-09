@@ -10,7 +10,6 @@ from ._utils.conversions import (
     uint16_to_bool_array,
 )
 from ._utils.sparce import (
-    peel_add_equation,
     peel_propagate,
     robust_soliton_cdf,
     subset_from_x,
@@ -23,6 +22,37 @@ from ._utils.sparce import (
 
 SEGMENT_PROBES = 4
 SALT = 0x9E3779B97F4A7C15
+HARDCODED_SALTS: dict[tuple[int, int], int] = {
+    (5, 2): 0x0000000000000000,
+    (5, 3): 0x0000000000000047,
+    (5, 4): 0x2189E53415694C18,
+    (5, 5): 0x4CDACBB36DEB8C11,
+    (5, 6): 0x720BA37C8CC9E713,
+    (5, 7): 0x720BA37C8CC9E713,
+    (5, 8): 0x50486B04304D489C,
+    (5, 9): 0x650C769DB2ADE9E2,
+    (5, 10): 0x0F5A9483E6FCCAD2,
+    (5, 11): 0x720BA37C8CC9E713,
+    (5, 12): 0x7E90960A3C08E584,
+    (5, 13): 0x41481E6D02854FDC,
+    (5, 14): 0x7E90960A3C08E584,
+    (5, 15): 0x41481E6D02854FDC,
+    (5, 16): 0x1F36787BCD01BB34,
+    (5, 17): 0x7E90960A3C08E584,
+    (5, 18): 0x7E90960A3C08E584,
+    (5, 19): 0x7E90960A3C08E584,
+    (5, 20): 0x650C769DB2ADE9E2,
+    (5, 21): 0x6B1C6E4FDD4A765B,
+    (5, 22): 0x50486B04304D489C,
+    (5, 23): 0x00232D25061485D4,
+    (5, 24): 0x22E12324C53FB16A,
+    (5, 25): 0x7E90960A3C08E584,
+    (5, 26): 0x0000000000000029,
+    (5, 27): 0x0FC761580AFF8B2C,
+    (5, 28): 0x7E42F9F58A4E58CC,
+    (5, 29): 0x7E42F9F58A4E58CC,
+    (5, 30): 0x0000000000000059,
+}
 
 
 def _raw_block_count(message_bitsize: int, packet_bitsize: int) -> int:
@@ -142,19 +172,75 @@ def _eval_sparse_coefficients(
     coefficients: List[int] | np.ndarray,
     cdf: List[float],
     salt: int,
+    singleton_by_x: dict[int, int],
 ) -> int:
-    subset = subset_from_x(
-        x, len(coefficients), cdf, salt, singleton_limit=len(coefficients)
-    )
+    singleton_idx = singleton_by_x.get(int(x))
+    if singleton_idx is not None:
+        return int(coefficients[singleton_idx])
+
+    subset = subset_from_x(x, len(coefficients), cdf, salt, singleton_limit=0)
     y = 0
     for idx in subset:
         y ^= int(coefficients[idx])
     return y
 
 
-def _select_agreed_xs(m: int) -> List[int]:
-    # With singleton_limit=m, x=0..m-1 gives the identity X matrix.
-    return list(range(m))
+def _select_agreed_xs(packet_bitsize: int, m: int) -> List[int]:
+    delimiter = (1 << packet_bitsize) - 1
+    if not (0 <= m < delimiter):
+        raise ValueError("cannot select delimiter-safe agreed x values")
+
+    # Keep pointer positions aligned with their stuffed columns, but spend one
+    # singleton on m because it is the common byte-stuffing "end" pointer.
+    if m == 0:
+        return []
+    return list(range(m - 1)) + [m]
+
+
+def _select_salt(packet_bitsize: int, m: int) -> int:
+    return HARDCODED_SALTS.get((packet_bitsize, m), SALT)
+
+
+def _peel_add_equation(
+    x: int,
+    y: int,
+    k: int,
+    cdf: List[float],
+    salt: int,
+    singleton_by_x: dict[int, int],
+    symbols: List[int | None],
+    pending: List[Tuple[Set[int], int]],
+) -> bool:
+    if k <= 0:
+        return False
+
+    singleton_idx = singleton_by_x.get(int(x))
+    if singleton_idx is not None:
+        subset = [singleton_idx]
+    else:
+        subset = subset_from_x(x, k, cdf, salt, singleton_limit=0)
+
+    rhs = int(y)
+    unknown: Set[int] = set()
+    for idx in subset:
+        known = symbols[idx]
+        if known is None:
+            unknown.add(idx)
+        else:
+            rhs ^= known
+
+    if not unknown:
+        return False
+
+    if len(unknown) == 1:
+        idx = next(iter(unknown))
+        if symbols[idx] is None:
+            symbols[idx] = rhs
+            return True
+        return False
+
+    pending.append((unknown, rhs))
+    return False
 
 
 def _solve_coefficients_from_agreed_y(
@@ -162,13 +248,16 @@ def _solve_coefficients_from_agreed_y(
     y_columns: np.ndarray,
     cdf: List[float],
     salt: int,
+    singleton_by_x: dict[int, int],
 ) -> np.ndarray:
     m = len(agreed_xs)
     symbols: List[int | None] = [None for _ in range(m)]
     pending: List[Tuple[Set[int], int]] = []
 
     for x, y in zip(agreed_xs, y_columns):
-        peel_add_equation(int(x), int(y), m, cdf, salt, symbols, pending)
+        _peel_add_equation(
+            int(x), int(y), m, cdf, salt, singleton_by_x, symbols, pending
+        )
         peel_propagate(symbols, pending)
 
     if any(v is None for v in symbols):
@@ -211,7 +300,9 @@ def create_protocol(config: Config) -> Protocol:
     delimiter = (1 << N) - 1
     m = raw_blocks + 1
     cdf = robust_soliton_cdf(m)
-    agreed_xs = _select_agreed_xs(m)
+    salt = _select_salt(packet_bitsize, m)
+    agreed_xs = _select_agreed_xs(packet_bitsize, m)
+    singleton_by_x = {int(x): idx for idx, x in enumerate(agreed_xs)}
 
     max_bits = max_message_bitsize(packet_bitsize)
     if message_bitsize > max_bits:
@@ -223,11 +314,11 @@ def create_protocol(config: Config) -> Protocol:
     def make_sampler(message: Message) -> Sampler:
         y_columns = _stuff_message(message, N, m)
         coefficients = _solve_coefficients_from_agreed_y(
-            agreed_xs, y_columns, cdf, SALT
+            agreed_xs, y_columns, cdf, salt, singleton_by_x
         )
 
         def f(x: int) -> int:
-            return _eval_sparse_coefficients(x, coefficients, cdf, SALT)
+            return _eval_sparse_coefficients(x, coefficients, cdf, salt, singleton_by_x)
 
         nxt = np.empty(delimiter, dtype=np.uint16)
         for x in range(delimiter):
@@ -240,6 +331,7 @@ def create_protocol(config: Config) -> Protocol:
         probes = min(SEGMENT_PROBES, delimiter)
         rng = np.random.default_rng(_sampler_seed(coefficients, N, message_bitsize))
         singleton_emit_counts = np.zeros(m, dtype=np.int32)
+        agreed_x_array = np.array(agreed_xs, dtype=np.int32)
 
         def remember(packet_id: int) -> None:
             if window <= 0:
@@ -269,9 +361,9 @@ def create_protocol(config: Config) -> Protocol:
 
         def choose_probe_starts() -> np.ndarray:
             min_singleton_count = int(np.min(singleton_emit_counts))
-            singleton_starts = np.flatnonzero(
+            singleton_starts = agreed_x_array[
                 singleton_emit_counts == min_singleton_count
-            )
+            ]
             eligible_singletons = singleton_starts[recent_counts[singleton_starts] == 0]
             if eligible_singletons.size == 0:
                 eligible_singletons = singleton_starts
@@ -294,22 +386,44 @@ def create_protocol(config: Config) -> Protocol:
 
             return rng.choice(eligible, size=probe_count, replace=False)
 
+        def segment_score(segment: List[int]) -> Tuple[int, float, int]:
+            rare_edges = 0
+            weighted_freshness = 0.0
+            min_count = int(np.min(singleton_emit_counts))
+
+            for curr_state, next_state in zip(segment, segment[1:]):
+                if next_state == delimiter:
+                    continue
+                singleton_idx = singleton_by_x.get(int(curr_state))
+                if singleton_idx is None:
+                    continue
+                count = int(singleton_emit_counts[singleton_idx])
+                if count == min_count:
+                    rare_edges += 1
+                weighted_freshness += 1.0 / float(count + 1)
+
+            return (rare_edges, weighted_freshness, len(segment))
+
         delimiter_packet = np.ones(N, dtype=np.bool_)
         while True:
             starts = choose_probe_starts()
 
             best_segment: List[int] = []
+            best_score: Tuple[int, float, int] | None = None
             for start in starts:
                 candidate = build_virtual_segment(int(start))
-                if len(candidate) > len(best_segment):
+                candidate_score = segment_score(candidate)
+                if best_score is None or candidate_score > best_score:
                     best_segment = candidate
+                    best_score = candidate_score
 
             if not best_segment:
                 best_segment = [0, int(nxt[0])]
 
             for curr_state, next_state in zip(best_segment, best_segment[1:]):
-                if curr_state < m and next_state != delimiter:
-                    singleton_emit_counts[curr_state] += 1
+                singleton_idx = singleton_by_x.get(int(curr_state))
+                if singleton_idx is not None and next_state != delimiter:
+                    singleton_emit_counts[singleton_idx] += 1
 
             for state in best_segment:
                 if state == delimiter:
@@ -339,7 +453,9 @@ def create_protocol(config: Config) -> Protocol:
             y = int(bool_array_to_uint16(packet))
             if x is not None and x not in seen_x:
                 seen_x.add(x)
-                peel_add_equation(x, y, m, cdf, SALT, coefficients, pending)
+                _peel_add_equation(
+                    x, y, m, cdf, salt, singleton_by_x, coefficients, pending
+                )
                 peel_propagate(coefficients, pending)
             x = y
 
@@ -347,7 +463,9 @@ def create_protocol(config: Config) -> Protocol:
         y_columns = np.empty(m, dtype=np.uint16)
         for i, agreed_x in enumerate(agreed_xs):
             y_columns[i] = np.uint16(
-                _eval_sparse_coefficients(agreed_x, coeff_array, cdf, SALT)
+                _eval_sparse_coefficients(
+                    agreed_x, coeff_array, cdf, salt, singleton_by_x
+                )
             )
 
         return _unstuff_message(y_columns, N, message_bitsize)
