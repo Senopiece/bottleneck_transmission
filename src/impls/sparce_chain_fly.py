@@ -6,9 +6,7 @@ import numpy as np
 
 from ._interface import Config, Estimator, Message, Protocol, Sampler
 from ._utils.conversions import (
-    bits_to_int,
     bool_array_to_uint16,
-    int_to_bits,
     uint16_to_bool_array,
 )
 from ._utils.sparce import (
@@ -40,44 +38,74 @@ def _check_capacity(packet_bitsize: int, raw_blocks: int) -> None:
     delimiter = (1 << packet_bitsize) - 1
     stuffed_blocks = raw_blocks + 1
 
-    if stuffed_blocks > delimiter:
-        raise ValueError(
-            "message_bitsize too large for sparce_chain_fly: "
-            f"requires m={stuffed_blocks}, but only {delimiter} non-delimiter x values exist"
-        )
-
     if not _has_stuffing_capacity(packet_bitsize, raw_blocks):
         raise ValueError(
-            "message_bitsize too large for delimiter stuffing at this packet_bitsize"
+            "message_bitsize too large for sparce_chain_fly: "
+            f"requires m={stuffed_blocks}, but delimiter-safe linked stuffing needs m < {delimiter}"
         )
 
 
 def _has_stuffing_capacity(packet_bitsize: int, raw_blocks: int) -> bool:
     delimiter = (1 << packet_bitsize) - 1
     stuffed_blocks = raw_blocks + 1
-    if stuffed_blocks > delimiter:
-        return False
-    return pow(delimiter, stuffed_blocks) >= (1 << (packet_bitsize * raw_blocks))
+    return stuffed_blocks < delimiter
 
 
-def _stuff_message(message: Message, packet_bitsize: int, m: int) -> np.ndarray:
-    delimiter = (1 << packet_bitsize) - 1
-    raw_bits = (m - 1) * packet_bitsize
-
+def _message_to_raw_blocks(
+    message: Message, packet_bitsize: int, raw_blocks: int
+) -> np.ndarray:
+    raw_bits = raw_blocks * packet_bitsize
     padded = np.zeros(raw_bits, dtype=np.bool_)
     if message.shape[0] > 0:
         padded[: message.shape[0]] = message
 
-    value = bits_to_int(padded)
-    stuffed = np.empty(m, dtype=np.uint16)
-    for i in range(m):
-        stuffed[i] = np.uint16(value % delimiter)
-        value //= delimiter
+    blocks = np.zeros(raw_blocks, dtype=np.uint16)
+    for i in range(raw_blocks):
+        value = 0
+        for bit in padded[i * packet_bitsize : (i + 1) * packet_bitsize]:
+            value = (value << 1) | int(bit)
+        blocks[i] = np.uint16(value)
+    return blocks
 
-    if value != 0:
-        raise ValueError(
-            "stuffed message overflowed; max_message_bitsize is inconsistent"
+
+def _raw_blocks_to_message(
+    raw_blocks: np.ndarray, packet_bitsize: int, message_bitsize: int
+) -> np.ndarray:
+    padded = np.zeros(raw_blocks.shape[0] * packet_bitsize, dtype=np.bool_)
+    for i, block in enumerate(raw_blocks):
+        value = int(block)
+        for j in range(packet_bitsize):
+            shift = packet_bitsize - 1 - j
+            padded[i * packet_bitsize + j] = bool((value >> shift) & 1)
+    return padded[:message_bitsize]
+
+
+def _stuff_message(message: Message, packet_bitsize: int, m: int) -> np.ndarray:
+    delimiter = (1 << packet_bitsize) - 1
+    if m >= delimiter:
+        raise ValueError("linked stuffing requires m to be below the delimiter value")
+
+    raw = _message_to_raw_blocks(message, packet_bitsize, m - 1)
+    stuffed = np.empty(m, dtype=np.uint16)
+    stuffed[1:] = raw
+
+    all_ones_positions = [
+        pos for pos, block in enumerate(raw, start=1) if int(block) == delimiter
+    ]
+
+    if all_ones_positions:
+        stuffed[0] = np.uint16(all_ones_positions[0])
+    else:
+        stuffed[0] = np.uint16(m)
+
+    for idx, pos in enumerate(all_ones_positions):
+        next_pos = (
+            all_ones_positions[idx + 1] if idx + 1 < len(all_ones_positions) else m
         )
+        stuffed[pos] = np.uint16(next_pos)
+
+    if np.any(stuffed == delimiter):
+        raise RuntimeError("linked stuffing produced a delimiter column")
 
     return stuffed
 
@@ -88,17 +116,25 @@ def _unstuff_message(
     message_bitsize: int,
 ) -> np.ndarray:
     delimiter = (1 << packet_bitsize) - 1
-    raw_bits = (stuffed.shape[0] - 1) * packet_bitsize
+    m = stuffed.shape[0]
+    if m >= delimiter:
+        raise ValueError("linked stuffing requires m to be below the delimiter value")
+    if np.any(stuffed == delimiter):
+        raise ValueError("stuffed message contains delimiter block")
 
-    value = 0
-    for i in range(stuffed.shape[0] - 1, -1, -1):
-        block = int(stuffed[i])
-        if block >= delimiter:
-            raise ValueError("stuffed message contains delimiter block")
-        value = value * delimiter + block
+    raw = np.array(stuffed[1:], dtype=np.uint16, copy=True)
+    pointer = int(stuffed[0])
+    if pointer < 1 or pointer > m:
+        raise ValueError("invalid stuffing head pointer")
 
-    padded = int_to_bits(value, raw_bits)
-    return padded[:message_bitsize]
+    while pointer < m:
+        next_pointer = int(stuffed[pointer])
+        if next_pointer <= pointer or next_pointer > m:
+            raise ValueError("invalid linked stuffing pointer chain")
+        raw[pointer - 1] = np.uint16(delimiter)
+        pointer = next_pointer
+
+    return _raw_blocks_to_message(raw, packet_bitsize, message_bitsize)
 
 
 def _eval_sparse_coefficients(
@@ -306,16 +342,7 @@ def max_message_bitsize(packet_bitsize: int) -> int:
         return 0
 
     delimiter = (1 << packet_bitsize) - 1
-    lo = 0
-    hi = delimiter - 1
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _has_stuffing_capacity(packet_bitsize, mid):
-            lo = mid
-        else:
-            hi = mid - 1
-
-    return packet_bitsize * lo - 50  # TODO: remove this -50
+    return packet_bitsize * max(0, delimiter - 2)
 
 
 def expected_packets_until_reconstructed(
