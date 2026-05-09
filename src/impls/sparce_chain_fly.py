@@ -239,6 +239,7 @@ def create_protocol(config: Config) -> Protocol:
 
         probes = min(SEGMENT_PROBES, delimiter)
         rng = np.random.default_rng(_sampler_seed(coefficients, N, message_bitsize))
+        singleton_emit_counts = np.zeros(m, dtype=np.int32)
 
         def remember(packet_id: int) -> None:
             if window <= 0:
@@ -267,6 +268,22 @@ def create_protocol(config: Config) -> Protocol:
                 cur = nxt_id
 
         def choose_probe_starts() -> np.ndarray:
+            min_singleton_count = int(np.min(singleton_emit_counts))
+            singleton_starts = np.flatnonzero(
+                singleton_emit_counts == min_singleton_count
+            )
+            eligible_singletons = singleton_starts[recent_counts[singleton_starts] == 0]
+            if eligible_singletons.size == 0:
+                eligible_singletons = singleton_starts
+
+            if eligible_singletons.size > 0:
+                probe_count = min(probes, int(eligible_singletons.size))
+                return rng.choice(
+                    eligible_singletons.astype(np.int32),
+                    size=probe_count,
+                    replace=False,
+                )
+
             eligible = np.flatnonzero(recent_counts == 0)
             if eligible.size == 0:
                 eligible = np.arange(delimiter, dtype=np.int32)
@@ -289,6 +306,10 @@ def create_protocol(config: Config) -> Protocol:
 
             if not best_segment:
                 best_segment = [0, int(nxt[0])]
+
+            for curr_state, next_state in zip(best_segment, best_segment[1:]):
+                if curr_state < m and next_state != delimiter:
+                    singleton_emit_counts[curr_state] += 1
 
             for state in best_segment:
                 if state == delimiter:

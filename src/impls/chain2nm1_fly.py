@@ -78,6 +78,7 @@ def create_protocol(config: Config) -> Protocol:
         window = m
         recent_counts = np.zeros(q, dtype=np.int32)
         recent: deque[int] = deque()
+        input_emit_counts = np.zeros(q, dtype=np.int32)
 
         probes = min(SEGMENT_PROBES, q)
         rng = np.random.default_rng(
@@ -108,30 +109,55 @@ def create_protocol(config: Config) -> Protocol:
                 cur = nxt_id
 
         def choose_probe_starts() -> np.ndarray:
-            # random starts from nodes not in last-m window
-            eligible = np.flatnonzero(recent_counts == 0)
+            min_count = int(np.min(input_emit_counts))
+            rare_inputs = np.flatnonzero(input_emit_counts == min_count)
+            eligible = rare_inputs[recent_counts[rare_inputs] == 0]
             if eligible.size == 0:
-                eligible = np.arange(q, dtype=np.int32)
+                eligible = rare_inputs
 
             probe_count = min(probes, int(eligible.size))
             if probe_count <= 0:
                 probe_count = 1
 
             # distinct starts when possible
-            return rng.choice(eligible, size=probe_count, replace=False)
+            return rng.choice(
+                eligible.astype(np.int32), size=probe_count, replace=False
+            )
+
+        def segment_score(segment: list[int]) -> tuple[int, float, int]:
+            inputs = segment[:-1]
+            if not inputs:
+                return (0, 0.0, 0)
+
+            min_count = int(np.min(input_emit_counts))
+            rare_edges = 0
+            weighted_freshness = 0.0
+            for x in inputs:
+                count = int(input_emit_counts[x])
+                if count == min_count:
+                    rare_edges += 1
+                weighted_freshness += 1.0 / float(count + 1)
+
+            return (rare_edges, weighted_freshness, len(segment))
 
         delimiter = np.ones(N, dtype=np.bool_)
         while True:
             starts = choose_probe_starts()
 
             best_segment: list[int] = []
+            best_score: tuple[int, float, int] | None = None
             for start in starts:
                 candidate = build_virtual_segment(int(start))
-                if len(candidate) > len(best_segment):
+                candidate_score = segment_score(candidate)
+                if best_score is None or candidate_score > best_score:
                     best_segment = candidate
+                    best_score = candidate_score
 
             if not best_segment:
                 best_segment = [0, int(nxt[0])]
+
+            for state in best_segment[:-1]:
+                input_emit_counts[state] += 1
 
             for state in best_segment:
                 remember(state)
