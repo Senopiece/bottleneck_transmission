@@ -28,7 +28,7 @@ from ._utils.sparce import (
 SEGMENT_PROBES = 4
 
 # Number of previous (n-1)-bit symbols packed into x for f(x).
-PREFIX = 1
+PREFIX = 2
 
 
 def sampler_seed(
@@ -70,7 +70,6 @@ def create_protocol(config: Config) -> Protocol:
     z = N - 1
     symbol_q = 1 << z
     symbol_mask = symbol_q - 1
-    packet_q = 1 << N
 
     input_bits = PREFIX * z
     if input_bits > MAX_PREFIX_INPUT_BITS:
@@ -78,6 +77,9 @@ def create_protocol(config: Config) -> Protocol:
             "phased_sparce_chain_fly is tailored for small packet sizes: "
             f"PREFIX*(packet_bitsize-1) must be <= {MAX_PREFIX_INPUT_BITS}, got {input_bits}"
         )
+    state_q = 1 << input_bits
+    state_mask = state_q - 1
+
     max_bits = max_message_bitsize(packet_bitsize)
     if message_bitsize > max_bits:
         raise ValueError(
@@ -138,29 +140,60 @@ def create_protocol(config: Config) -> Protocol:
         def phased_output(symbol: int, is_phase_b: bool):
             return uint16_to_bool_array(np.uint16(packet_id(symbol, is_phase_b)), N)
 
-        nxt = np.empty(packet_q, dtype=np.int32)
-        for pid in range(packet_q):
-            symbol, phase_b = packet_from_id(pid)
-            next_symbol = f2(symbol) if phase_b else f1(symbol)
-            nxt[pid] = packet_id(next_symbol, not phase_b)
+        def state_id(x: int, src_phase_b: bool) -> int:
+            return int(x) + (state_q if src_phase_b else 0)
+
+        def state_from_id(value: int) -> tuple[int, bool]:
+            return value & state_mask, bool(value & state_q)
+
+        def x_to_symbols(x: int) -> list[int]:
+            symbols = [0 for _ in range(PREFIX)]
+            curr = int(x)
+            for i in range(PREFIX - 1, -1, -1):
+                symbols[i] = curr & symbol_mask
+                curr >>= z
+            return symbols
+
+        prefix_tail_mask = (1 << ((PREFIX - 1) * z)) - 1 if PREFIX > 1 else 0
+
+        def shift_x(x: int, y: int) -> int:
+            return (((int(x) & prefix_tail_mask) << z) | int(y)) & state_mask
+
+        def prefix_packets_for_state(sid: int) -> list[int]:
+            x, src_phase_b = state_from_id(sid)
+            symbols = x_to_symbols(x)
+            return [
+                packet_id(symbol, bool(src_phase_b ^ ((PREFIX - 1 - i) & 1)))
+                for i, symbol in enumerate(symbols)
+            ]
+
+        state_count = 2 * state_q
+        nxt_state = np.empty(state_count, dtype=np.int32)
+        nxt_packet = np.empty(state_count, dtype=np.int32)
+        for sid in range(state_count):
+            x, src_phase_b = state_from_id(sid)
+            next_symbol = f2(x) if src_phase_b else f1(x)
+            next_phase_b = not src_phase_b
+            nxt_packet[sid] = packet_id(next_symbol, next_phase_b)
+            nxt_state[sid] = state_id(shift_x(x, next_symbol), next_phase_b)
 
         max_window = max(0, symbol_q - 6)
         window_a = min(max_window, k1)
         window_b = min(max_window, k2)
-        recent_counts_a = np.zeros(packet_q, dtype=np.int32)
-        recent_counts_b = np.zeros(packet_q, dtype=np.int32)
+        recent_counts_a = np.zeros(state_count, dtype=np.int32)
+        recent_counts_b = np.zeros(state_count, dtype=np.int32)
         recent_a: deque[int] = deque()
         recent_b: deque[int] = deque()
 
-        probes = min(SEGMENT_PROBES, packet_q)
+        probes = min(SEGMENT_PROBES, state_count)
         rng = np.random.default_rng(
             sampler_seed(symbols_a, symbols_b, packet_bitsize, message_bitsize)
         )
-        singleton_emit_counts = np.zeros(packet_q, dtype=np.int32)
+        singleton_emit_counts = np.zeros(state_count, dtype=np.int32)
 
-        singleton_ids_a = np.arange(0, min(k1, symbol_q), dtype=np.int32)
+        singleton_ids_a = np.arange(0, min(k1, state_q), dtype=np.int32)
         singleton_ids_b = np.arange(
-            symbol_q, symbol_q + min(k2, symbol_q), dtype=np.int32
+            state_q, state_q + min(k2, state_q), dtype=np.int32
         )
         all_singleton_ids = np.concatenate((singleton_ids_a, singleton_ids_b))
 
@@ -176,19 +209,19 @@ def create_protocol(config: Config) -> Protocol:
         def singleton_ids_for_phase(phase_b: bool) -> np.ndarray:
             return singleton_ids_b if phase_b else singleton_ids_a
 
-        def is_singleton_input(pid: int) -> bool:
-            symbol, phase_b = packet_from_id(pid)
-            return symbol < (k2 if phase_b else k1)
+        def is_singleton_input(sid: int) -> bool:
+            x, src_phase_b = state_from_id(sid)
+            return x < (k2 if src_phase_b else k1)
 
-        def remember(pid: int) -> None:
-            _, phase_b = packet_from_id(pid)
-            window = window_for_phase(phase_b)
+        def remember(sid: int) -> None:
+            _, src_phase_b = state_from_id(sid)
+            window = window_for_phase(src_phase_b)
             if window <= 0:
                 return
-            recent_counts = counts_for_phase(phase_b)
-            recent = recent_for_phase(phase_b)
-            recent.append(pid)
-            recent_counts[pid] += 1
+            recent_counts = counts_for_phase(src_phase_b)
+            recent = recent_for_phase(src_phase_b)
+            recent.append(sid)
+            recent_counts[sid] += 1
             if len(recent) > window:
                 dropped = recent.popleft()
                 recent_counts[dropped] -= 1
@@ -199,16 +232,16 @@ def create_protocol(config: Config) -> Protocol:
             cur = start
 
             while True:
-                next_id = int(nxt[cur])
+                next_id = int(nxt_state[cur])
                 segment.append(next_id)
-                _, next_phase_b = packet_from_id(next_id)
+                _, next_phase_b = state_from_id(next_id)
                 if counts_for_phase(next_phase_b)[next_id] > 0 or next_id in visited:
                     return segment
                 visited.add(next_id)
                 cur = next_id
 
         def choose_probe_starts(start_phase_b: bool) -> np.ndarray:
-            phase_offset = symbol_q if start_phase_b else 0
+            phase_offset = state_q if start_phase_b else 0
             singleton_ids = singleton_ids_for_phase(start_phase_b)
             if singleton_ids.size > 0:
                 min_singleton_count = int(np.min(singleton_emit_counts[singleton_ids]))
@@ -229,7 +262,7 @@ def create_protocol(config: Config) -> Protocol:
                         replace=False,
                     )
 
-            phase_ids = np.arange(phase_offset, phase_offset + symbol_q, dtype=np.int32)
+            phase_ids = np.arange(phase_offset, phase_offset + state_q, dtype=np.int32)
             recent_counts = counts_for_phase(start_phase_b)
             eligible = phase_ids[recent_counts[phase_ids] == 0]
             if eligible.size == 0:
@@ -248,7 +281,7 @@ def create_protocol(config: Config) -> Protocol:
             return bool(np.any(singleton_emit_counts[singleton_ids] == 0))
 
         def segment_end_phase(segment: list[int]) -> bool:
-            _, phase_b = packet_from_id(segment[-1])
+            _, phase_b = state_from_id(segment[-1])
             return phase_b
 
         def segment_score(segment: list[int]) -> tuple[int, float, int]:
@@ -283,8 +316,8 @@ def create_protocol(config: Config) -> Protocol:
                     best_score = candidate_score
 
             if not best_segment:
-                start_id = packet_id(0, next_start_phase_b)
-                best_segment = [start_id, int(nxt[start_id])]
+                start_id = state_id(0, next_start_phase_b)
+                best_segment = [start_id, int(nxt_state[start_id])]
 
             if has_pending_singletons(next_start_phase_b):
                 desired_next_phase_b = next_start_phase_b
@@ -299,19 +332,24 @@ def create_protocol(config: Config) -> Protocol:
             ):
                 best_segment.pop()
 
-            first_symbol, first_phase_b = packet_from_id(best_segment[0])
+            prefix_packets = prefix_packets_for_state(best_segment[0])
+            first_symbol, first_phase_b = packet_from_id(prefix_packets[0])
             yield phased_output(first_symbol, first_phase_b)
+            for pid in prefix_packets:
+                symbol, phase_b = packet_from_id(pid)
+                yield phased_output(symbol, phase_b)
 
             for curr_state, _next_state in zip(best_segment, best_segment[1:]):
                 if is_singleton_input(curr_state):
                     singleton_emit_counts[curr_state] += 1
 
-            for pid in best_segment:
-                remember(pid)
+            for sid in best_segment[:-1]:
+                remember(sid)
+                pid = int(nxt_packet[sid])
                 symbol, phase_b = packet_from_id(pid)
                 yield phased_output(symbol, phase_b)
 
-            _, next_start_phase_b = packet_from_id(best_segment[-1])
+            _, next_start_phase_b = state_from_id(best_segment[-1])
 
     def make_estimator() -> Estimator:
         symbols_a: List[int | None] = [None for _ in range(k1)]
@@ -325,6 +363,7 @@ def create_protocol(config: Config) -> Protocol:
         run_symbols: List[int] = []
         run_phases: List[bool] = []
         max_run_keep = PREFIX + 1
+        pending_edge: Tuple[int, int, bool, bool] | None = None
 
         total_k = k1 + k2
 
@@ -355,6 +394,25 @@ def create_protocol(config: Config) -> Protocol:
 
             return np.concatenate(parts)
 
+        def commit_pending_edge() -> None:
+            nonlocal pending_edge
+            if pending_edge is None:
+                return
+
+            x, y, src_phase, dst_phase = pending_edge
+            pending_edge = None
+
+            if (not src_phase) and dst_phase:
+                if k1 > 0 and x not in seen_a:
+                    seen_a[x] = y
+                    peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
+                    peel_propagate(symbols_a, pending_a)
+            elif src_phase and (not dst_phase):
+                if k2 > 0 and x not in seen_b:
+                    seen_b[x] = y
+                    peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
+                    peel_propagate(symbols_b, pending_b)
+
         while True:
             done = maybe_done()
             if done is not None:
@@ -363,6 +421,7 @@ def create_protocol(config: Config) -> Protocol:
             packet = yield progress()
 
             if packet is None:
+                pending_edge = None
                 run_symbols.clear()
                 run_phases.clear()
                 continue
@@ -371,6 +430,12 @@ def create_protocol(config: Config) -> Protocol:
             curr_symbol = int(bool_array_to_uint16(packet) & symbol_mask)
 
             if run_phases and curr_phase == run_phases[-1]:
+                is_duplicate_reset = curr_symbol == run_symbols[-1]
+                if pending_edge is not None:
+                    if is_duplicate_reset:
+                        pending_edge = None
+                    else:
+                        commit_pending_edge()
                 run_symbols[:] = [curr_symbol]
                 run_phases[:] = [curr_phase]
                 continue
@@ -385,21 +450,14 @@ def create_protocol(config: Config) -> Protocol:
             if len(run_symbols) < (PREFIX + 1):
                 continue
 
+            commit_pending_edge()
+
             x = pack_prefix_symbols(run_symbols[-(PREFIX + 1) : -1], z)
             y = run_symbols[-1]
             src_phase = run_phases[-2]
             dst_phase = run_phases[-1]
 
-            if (not src_phase) and dst_phase:
-                if k1 > 0 and x not in seen_a:
-                    seen_a[x] = y
-                    peel_add_equation(x, y, k1, cdf_a, salt_a, symbols_a, pending_a)
-                    peel_propagate(symbols_a, pending_a)
-            elif src_phase and (not dst_phase):
-                if k2 > 0 and x not in seen_b:
-                    seen_b[x] = y
-                    peel_add_equation(x, y, k2, cdf_b, salt_b, symbols_b, pending_b)
-                    peel_propagate(symbols_b, pending_b)
+            pending_edge = (x, y, src_phase, dst_phase)
 
     return Protocol(
         make_sampler=make_sampler,
