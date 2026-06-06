@@ -156,7 +156,13 @@ def create_protocol(config: Config) -> Protocol:
         rng = np.random.default_rng(
             sampler_seed(symbols_a, symbols_b, packet_bitsize, message_bitsize)
         )
-        started_singletons = np.zeros(packet_q, dtype=np.bool_)
+        singleton_emit_counts = np.zeros(packet_q, dtype=np.int32)
+
+        singleton_ids_a = np.arange(0, min(k1, symbol_q), dtype=np.int32)
+        singleton_ids_b = np.arange(
+            symbol_q, symbol_q + min(k2, symbol_q), dtype=np.int32
+        )
+        all_singleton_ids = np.concatenate((singleton_ids_a, singleton_ids_b))
 
         def counts_for_phase(phase_b: bool) -> np.ndarray:
             return recent_counts_b if phase_b else recent_counts_a
@@ -166,6 +172,13 @@ def create_protocol(config: Config) -> Protocol:
 
         def window_for_phase(phase_b: bool) -> int:
             return window_b if phase_b else window_a
+
+        def singleton_ids_for_phase(phase_b: bool) -> np.ndarray:
+            return singleton_ids_b if phase_b else singleton_ids_a
+
+        def is_singleton_input(pid: int) -> bool:
+            symbol, phase_b = packet_from_id(pid)
+            return symbol < (k2 if phase_b else k1)
 
         def remember(pid: int) -> None:
             _, phase_b = packet_from_id(pid)
@@ -196,18 +209,24 @@ def create_protocol(config: Config) -> Protocol:
 
         def choose_probe_starts(start_phase_b: bool) -> np.ndarray:
             phase_offset = symbol_q if start_phase_b else 0
-            singleton_count = k2 if start_phase_b else k1
-            if singleton_count > 0:
-                singleton_ids = np.arange(
-                    phase_offset,
-                    phase_offset + min(singleton_count, symbol_q),
-                    dtype=np.int32,
-                )
-                pending_singletons = singleton_ids[~started_singletons[singleton_ids]]
-                if pending_singletons.size > 0:
-                    probe_count = min(probes, int(pending_singletons.size))
+            singleton_ids = singleton_ids_for_phase(start_phase_b)
+            if singleton_ids.size > 0:
+                min_singleton_count = int(np.min(singleton_emit_counts[singleton_ids]))
+                singleton_starts = singleton_ids[
+                    singleton_emit_counts[singleton_ids] == min_singleton_count
+                ]
+                eligible_singletons = singleton_starts[
+                    counts_for_phase(start_phase_b)[singleton_starts] == 0
+                ]
+                if eligible_singletons.size == 0:
+                    eligible_singletons = singleton_starts
+
+                if eligible_singletons.size > 0:
+                    probe_count = min(probes, int(eligible_singletons.size))
                     return rng.choice(
-                        pending_singletons, size=probe_count, replace=False
+                        eligible_singletons.astype(np.int32),
+                        size=probe_count,
+                        replace=False,
                     )
 
             phase_ids = np.arange(phase_offset, phase_offset + symbol_q, dtype=np.int32)
@@ -223,30 +242,45 @@ def create_protocol(config: Config) -> Protocol:
             return rng.choice(eligible, size=probe_count, replace=False)
 
         def has_pending_singletons(phase_b: bool) -> bool:
-            phase_offset = symbol_q if phase_b else 0
-            singleton_count = k2 if phase_b else k1
-            if singleton_count <= 0:
+            singleton_ids = singleton_ids_for_phase(phase_b)
+            if singleton_ids.size == 0:
                 return False
-            singleton_ids = np.arange(
-                phase_offset,
-                phase_offset + min(singleton_count, symbol_q),
-                dtype=np.int32,
-            )
-            return bool(np.any(~started_singletons[singleton_ids]))
+            return bool(np.any(singleton_emit_counts[singleton_ids] == 0))
 
         def segment_end_phase(segment: list[int]) -> bool:
             _, phase_b = packet_from_id(segment[-1])
             return phase_b
+
+        def segment_score(segment: list[int]) -> tuple[int, float, int]:
+            if all_singleton_ids.size == 0:
+                return (0, 0.0, len(segment))
+
+            min_count = int(np.min(singleton_emit_counts[all_singleton_ids]))
+            rare_edges = 0
+            weighted_freshness = 0.0
+
+            for curr_state, _next_state in zip(segment, segment[1:]):
+                if not is_singleton_input(curr_state):
+                    continue
+                count = int(singleton_emit_counts[curr_state])
+                if count == min_count:
+                    rare_edges += 1
+                weighted_freshness += 1.0 / float(count + 1)
+
+            return (rare_edges, weighted_freshness, len(segment))
 
         next_start_phase_b = False
         while True:
             starts = choose_probe_starts(next_start_phase_b)
 
             best_segment: list[int] = []
+            best_score: tuple[int, float, int] | None = None
             for start in starts:
                 candidate = build_virtual_segment(int(start))
-                if len(candidate) > len(best_segment):
+                candidate_score = segment_score(candidate)
+                if best_score is None or candidate_score > best_score:
                     best_segment = candidate
+                    best_score = candidate_score
 
             if not best_segment:
                 start_id = packet_id(0, next_start_phase_b)
@@ -268,8 +302,10 @@ def create_protocol(config: Config) -> Protocol:
             first_symbol, first_phase_b = packet_from_id(best_segment[0])
             yield phased_output(first_symbol, first_phase_b)
 
-            if len(best_segment) > 1:
-                started_singletons[best_segment[0]] = True
+            for curr_state, _next_state in zip(best_segment, best_segment[1:]):
+                if is_singleton_input(curr_state):
+                    singleton_emit_counts[curr_state] += 1
+
             for pid in best_segment:
                 remember(pid)
                 symbol, phase_b = packet_from_id(pid)
