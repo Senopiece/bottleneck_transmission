@@ -19,17 +19,17 @@ from .phased_sparce_chain_fly import (
     create_protocol as create_base_protocol,
 )
 
-# Same packet stream as phased_sparce_chain_fly. The receiver does not return
-# immediately after peeling succeeds: it gathers a small tail of extra equations,
-# then performs bounded vote repair over the sparse equation graph.
+# Same sender as phased_sparce_chain_fly, but a more conservative receiver:
+# - infer phase from alternating-run majority instead of trusting one phase bit;
+# - require repeated/majority non-singleton x observations before peeling;
+# - validate/repair the final solution against all collected equations.
 
 COMMIT_LAG = 1
 MIN_PEEL_WEIGHT = 1.0
-EXTRA_EVENT_RATE = 0.25
-MIN_EXTRA_EVENTS = 8
-REPAIR_PASSES = 4
-MIN_REPAIR_WEIGHT = 2.0
-REPAIR_MARGIN = 0.75
+NON_SINGLETON_MIN_PEEL_WEIGHT = 1.4
+NON_SINGLETON_MARGIN = 0.75
+REPAIR_PASSES = 3
+VALIDATION_EVENTS = 4
 
 
 def create_protocol(config: Config) -> Protocol:
@@ -51,14 +51,14 @@ def create_protocol(config: Config) -> Protocol:
     input_bits = PREFIX * z
     if input_bits > MAX_PREFIX_INPUT_BITS:
         raise ValueError(
-            "delayed_vote_phased_sparce_chain_fly is tailored for small packet sizes: "
+            "confirmed_x_phased_sparce_chain_fly is tailored for small packet sizes: "
             f"PREFIX*(packet_bitsize-1) must be <= {MAX_PREFIX_INPUT_BITS}, got {input_bits}"
         )
 
     max_bits = max_message_bitsize(packet_bitsize)
     if message_bitsize > max_bits:
         raise ValueError(
-            "message_bitsize too large for delayed_vote_phased_sparce_chain_fly: "
+            "message_bitsize too large for confirmed_x_phased_sparce_chain_fly: "
             f"max {max_bits} for packet_bitsize={packet_bitsize}"
         )
 
@@ -74,8 +74,6 @@ def create_protocol(config: Config) -> Protocol:
     salt_a = 0x9E3779B97F4A7C15
     salt_b = 0xD1B54A32D192ED03
 
-    extra_events = max(MIN_EXTRA_EVENTS, math.ceil((k1 + k2) * EXTRA_EVENT_RATE))
-
     def make_estimator() -> Estimator:
         symbols_a: List[int | None] = [None for _ in range(k1)]
         symbols_b: List[int | None] = [None for _ in range(k2)]
@@ -85,6 +83,7 @@ def create_protocol(config: Config) -> Protocol:
         peeled_x_a: Set[int] = set()
         peeled_x_b: Set[int] = set()
 
+        # Equations are (subset, rhs, confidence_weight).
         equations_a: List[Tuple[List[int], int, float]] = []
         equations_b: List[Tuple[List[int], int, float]] = []
         observed_a: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
@@ -93,7 +92,7 @@ def create_protocol(config: Config) -> Protocol:
         run_symbols: List[int] = []
         run_observed_phases: List[bool] = []
         next_edge_index = PREFIX
-        extra_remaining: int | None = None
+        validation_events_remaining: int | None = None
 
         total_k = k1 + k2
 
@@ -103,16 +102,17 @@ def create_protocol(config: Config) -> Protocol:
             known = sum(1 for v in symbols_a if v is not None) + sum(
                 1 for v in symbols_b if v is not None
             )
-            return min(1.0, known / total_k)
+            return known / total_k
 
-        def phase_model(phases: List[bool]) -> tuple[bool, int]:
+        def phase_model(phases: List[bool]) -> tuple[bool, int, int]:
             if not phases:
-                return False, 0
+                return False, 0, 0
+
             true_votes = sum(int(bool(phase) ^ bool(i & 1)) for i, phase in enumerate(phases))
             false_votes = len(phases) - true_votes
             if true_votes > false_votes:
-                return True, true_votes - false_votes
-            return False, false_votes - true_votes
+                return True, true_votes, true_votes - false_votes
+            return False, false_votes, false_votes - true_votes
 
         def model_phase(start_phase: bool, index: int) -> bool:
             return bool(start_phase ^ bool(index & 1))
@@ -129,8 +129,8 @@ def create_protocol(config: Config) -> Protocol:
                 return 1.0
             if errors == 0:
                 return 0.8
-            if errors == 1 and margin >= 3:
-                return 0.2
+            if errors == 1:
+                return 0.1
             return 0.0
 
         def add_equation(
@@ -149,11 +149,17 @@ def create_protocol(config: Config) -> Protocol:
                 subset = subset_from_x(x, k1, cdf_a, salt_a, singleton_limit=k1)
                 equations_a.append((subset, y, weight))
                 observed_a[x][y] += weight
-                if weight >= MIN_PEEL_WEIGHT and x not in peeled_x_a:
-                    y_majority = max(observed_a[x].items(), key=lambda item: item[1])[0]
+                ranked = sorted(
+                    observed_a[x].items(), key=lambda item: item[1], reverse=True
+                )
+                best_y, best_weight = ranked[0]
+                second_weight = ranked[1][1] if len(ranked) > 1 else 0.0
+                threshold = MIN_PEEL_WEIGHT if x < k1 else NON_SINGLETON_MIN_PEEL_WEIGHT
+                margin_ok = x < k1 or best_weight >= second_weight + NON_SINGLETON_MARGIN
+                if best_weight >= threshold and margin_ok and x not in peeled_x_a:
                     peeled_x_a.add(x)
                     peel_add_equation(
-                        x, y_majority, k1, cdf_a, salt_a, symbols_a, pending_a
+                        x, best_y, k1, cdf_a, salt_a, symbols_a, pending_a
                     )
                     peel_propagate(symbols_a, pending_a)
             elif src_phase and (not dst_phase):
@@ -162,11 +168,17 @@ def create_protocol(config: Config) -> Protocol:
                 subset = subset_from_x(x, k2, cdf_b, salt_b, singleton_limit=k2)
                 equations_b.append((subset, y, weight))
                 observed_b[x][y] += weight
-                if weight >= MIN_PEEL_WEIGHT and x not in peeled_x_b:
-                    y_majority = max(observed_b[x].items(), key=lambda item: item[1])[0]
+                ranked = sorted(
+                    observed_b[x].items(), key=lambda item: item[1], reverse=True
+                )
+                best_y, best_weight = ranked[0]
+                second_weight = ranked[1][1] if len(ranked) > 1 else 0.0
+                threshold = MIN_PEEL_WEIGHT if x < k2 else NON_SINGLETON_MIN_PEEL_WEIGHT
+                margin_ok = x < k2 or best_weight >= second_weight + NON_SINGLETON_MARGIN
+                if best_weight >= threshold and margin_ok and x not in peeled_x_b:
                     peeled_x_b.add(x)
                     peel_add_equation(
-                        x, y_majority, k2, cdf_b, salt_b, symbols_b, pending_b
+                        x, best_y, k2, cdf_b, salt_b, symbols_b, pending_b
                     )
                     peel_propagate(symbols_b, pending_b)
 
@@ -175,7 +187,7 @@ def create_protocol(config: Config) -> Protocol:
             if len(run_symbols) < PREFIX + 1:
                 return
 
-            start_phase, margin = phase_model(run_observed_phases)
+            start_phase, _score, margin = phase_model(run_observed_phases)
             max_ready = len(run_symbols) - 1 - COMMIT_LAG
 
             while next_edge_index <= max_ready:
@@ -198,60 +210,85 @@ def create_protocol(config: Config) -> Protocol:
                 run_symbols.append(symbol)
                 run_observed_phases.append(phase)
 
+        def domain_penalty(
+            values: List[int], equations: List[Tuple[List[int], int, float]]
+        ) -> float:
+            penalty = 0.0
+            for subset, rhs, weight in equations:
+                lhs = 0
+                for idx in subset:
+                    lhs ^= values[idx]
+                if lhs != rhs:
+                    penalty += weight
+            return penalty
+
         def repair_domain(
             symbols: List[int | None],
             equations: List[Tuple[List[int], int, float]],
-        ) -> List[int]:
+        ) -> tuple[List[int], float]:
             values = [int(v) for v in symbols if v is not None]
             if len(values) != len(symbols) or not equations:
-                return values
+                return values, 0.0
 
-            by_symbol: List[List[int]] = [[] for _ in range(len(values))]
-            for equation_idx, (subset, _rhs, _weight) in enumerate(equations):
+            by_symbol: List[List[Tuple[List[int], int, float]]] = [
+                [] for _ in range(len(values))
+            ]
+            for equation in equations:
+                subset, _rhs, _weight = equation
                 for idx in subset:
-                    by_symbol[idx].append(equation_idx)
+                    by_symbol[idx].append(equation)
+
+            def local_penalty(idx: int, candidate: int) -> float:
+                old = values[idx]
+                values[idx] = candidate
+                penalty = 0.0
+                for subset, rhs, weight in by_symbol[idx]:
+                    lhs = 0
+                    for symbol_idx in subset:
+                        lhs ^= values[symbol_idx]
+                    if lhs != rhs:
+                        penalty += weight
+                values[idx] = old
+                return penalty
 
             for _ in range(REPAIR_PASSES):
-                votes: List[dict[int, float]] = [defaultdict(float) for _ in values]
-
-                for subset, rhs, weight in equations:
-                    lhs = 0
-                    for idx in subset:
-                        lhs ^= values[idx]
-                    residual = (lhs ^ rhs) & symbol_mask
-                    if residual == 0:
-                        continue
-                    for idx in subset:
-                        votes[idx][values[idx] ^ residual] += weight
-
                 changed = False
-                for idx, vote_map in enumerate(votes):
-                    if not vote_map:
+                for idx in range(len(values)):
+                    if not by_symbol[idx]:
                         continue
-                    ranked = sorted(vote_map.items(), key=lambda item: item[1], reverse=True)
-                    best_value, best_weight = ranked[0]
-                    second_weight = ranked[1][1] if len(ranked) > 1 else 0.0
-                    if (
-                        best_weight >= MIN_REPAIR_WEIGHT
-                        and best_weight >= second_weight + REPAIR_MARGIN
-                        and best_value != values[idx]
-                    ):
-                        values[idx] = int(best_value) & symbol_mask
+                    current = values[idx]
+                    best_value = current
+                    best_penalty = local_penalty(idx, current)
+                    for candidate in range(symbol_q):
+                        if candidate == current:
+                            continue
+                        candidate_penalty = local_penalty(idx, candidate)
+                        if candidate_penalty + 1e-12 < best_penalty:
+                            best_penalty = candidate_penalty
+                            best_value = candidate
+                    if best_value != current:
+                        values[idx] = best_value
                         changed = True
-
                 if not changed:
                     break
 
-            return values
+            return values, domain_penalty(values, equations)
 
-        def all_symbols_known() -> bool:
-            return not any(v is None for v in symbols_a) and not any(
-                v is None for v in symbols_b
-            )
+        def maybe_done() -> np.ndarray | None:
+            nonlocal validation_events_remaining
+            if any(v is None for v in symbols_a) or any(v is None for v in symbols_b):
+                return None
 
-        def build_message() -> np.ndarray:
-            repaired_a = repair_domain(symbols_a, equations_a)
-            repaired_b = repair_domain(symbols_b, equations_b)
+            repaired_a, _penalty_a = repair_domain(symbols_a, equations_a)
+            repaired_b, _penalty_b = repair_domain(symbols_b, equations_b)
+            total_penalty = _penalty_a + _penalty_b
+
+            if total_penalty > 0.0:
+                if validation_events_remaining is None:
+                    validation_events_remaining = VALIDATION_EVENTS
+                    return None
+                if validation_events_remaining > 0:
+                    return None
 
             parts = []
             if k1 > 0:
@@ -269,18 +306,16 @@ def create_protocol(config: Config) -> Protocol:
             return np.concatenate(parts)
 
         while True:
-            if all_symbols_known():
-                if extra_remaining is None:
-                    extra_remaining = extra_events
-                elif extra_remaining <= 0:
-                    return build_message()
+            done = maybe_done()
+            if done is not None:
+                return done
 
             packet = yield progress()
 
             if packet is None:
                 reset_run()
-                if extra_remaining is not None:
-                    extra_remaining -= 1
+                if validation_events_remaining is not None and validation_events_remaining > 0:
+                    validation_events_remaining -= 1
                 continue
 
             curr_phase = bool(packet[0])
@@ -292,13 +327,13 @@ def create_protocol(config: Config) -> Protocol:
                 and curr_symbol == run_symbols[-1]
             ):
                 reset_run(curr_symbol, curr_phase)
-            else:
-                run_symbols.append(curr_symbol)
-                run_observed_phases.append(curr_phase)
-                commit_ready_edges()
+                continue
 
-            if extra_remaining is not None:
-                extra_remaining -= 1
+            run_symbols.append(curr_symbol)
+            run_observed_phases.append(curr_phase)
+            commit_ready_edges()
+            if validation_events_remaining is not None and validation_events_remaining > 0:
+                validation_events_remaining -= 1
 
     return Protocol(
         make_sampler=base_protocol.make_sampler,
