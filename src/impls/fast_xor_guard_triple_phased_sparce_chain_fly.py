@@ -8,11 +8,14 @@ from ._utils import sparce
 
 # Same 3+1 xor guard as xor_guard_triple_phased_sparce_chain_fly, but with a
 # more aggressive robust-soliton distribution inside the sparse chain.
-# It keeps PREFIX=2, so decode complexity stays in the same small state space.
+# It also gives segment length a small sender-side tie-break bonus. It keeps
+# PREFIX=2, so decode complexity stays in the same small state space.
 
 GROUP_SIZE = 3
-SOLITON_C = 0.05
-SOLITON_DELTA = 0.20
+SOLITON_C = 0.02
+SOLITON_DELTA = 0.65
+SEGMENT_LENGTH_BONUS = 0.0
+MIN_TUNED_MESSAGE_BITSIZE = 96
 
 
 def _xor_packets(packets: list[np.ndarray]) -> np.ndarray:
@@ -27,16 +30,22 @@ def _same_packet(a: np.ndarray, b: np.ndarray) -> bool:
 
 
 def _create_base_protocol(config: Config) -> Protocol:
+    if config.message_bitsize < MIN_TUNED_MESSAGE_BITSIZE:
+        return base_module.create_protocol(config)
+
     old_robust_soliton_cdf = base_module.robust_soliton_cdf
+    old_segment_length_bonus = base_module.SEGMENT_LENGTH_BONUS
 
     def tuned_robust_soliton_cdf(k: int) -> list[float]:
         return sparce.robust_soliton_cdf(k, c=SOLITON_C, delta=SOLITON_DELTA)
 
     base_module.robust_soliton_cdf = tuned_robust_soliton_cdf
+    base_module.SEGMENT_LENGTH_BONUS = SEGMENT_LENGTH_BONUS
     try:
         return base_module.create_protocol(config)
     finally:
         base_module.robust_soliton_cdf = old_robust_soliton_cdf
+        base_module.SEGMENT_LENGTH_BONUS = old_segment_length_bonus
 
 
 def create_protocol(config: Config) -> Protocol:

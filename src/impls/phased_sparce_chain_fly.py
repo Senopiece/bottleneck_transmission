@@ -26,6 +26,8 @@ from ._utils.sparce import (
 # skip_observation: 1.0
 
 SEGMENT_PROBES = 4
+RECENT_WINDOW_MARGIN = 6
+SEGMENT_LENGTH_BONUS = 0.0
 
 # Number of previous (n-1)-bit symbols packed into x for f(x).
 PREFIX = 2
@@ -177,7 +179,7 @@ def create_protocol(config: Config) -> Protocol:
             nxt_packet[sid] = packet_id(next_symbol, next_phase_b)
             nxt_state[sid] = state_id(shift_x(x, next_symbol), next_phase_b)
 
-        max_window = max(0, symbol_q - 6)
+        max_window = max(0, symbol_q - RECENT_WINDOW_MARGIN)
         window_a = min(max_window, k1)
         window_b = min(max_window, k2)
         recent_counts_a = np.zeros(state_count, dtype=np.int32)
@@ -299,6 +301,9 @@ def create_protocol(config: Config) -> Protocol:
                 if count == min_count:
                     rare_edges += 1
                 weighted_freshness += 1.0 / float(count + 1)
+
+            if SEGMENT_LENGTH_BONUS:
+                weighted_freshness += SEGMENT_LENGTH_BONUS * len(segment)
 
             return (rare_edges, weighted_freshness, len(segment))
 
