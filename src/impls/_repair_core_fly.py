@@ -41,6 +41,8 @@ REPAIR_PASSES = 3
 SINGLETON_CONFIRMATIONS = 1
 RANSAC_REPAIR_ITERATIONS = 0
 RANSAC_REPAIR_MAX_SYMBOLS = 64
+RANSAC_MAJORITY_TOP = 0
+RANSAC_MAJORITY_MARGIN = 0
 
 # Number of previous (n-1)-bit symbols packed into x for f(x).
 PREFIX = 2
@@ -698,11 +700,15 @@ def create_protocol(config: Config) -> Protocol:
                 current_conflicts = equation_conflicts(symbols)
                 best_symbols = [int(value) for value in symbols]
                 best_conflicts = current_conflicts
+                ransac_candidates: List[Tuple[int, List[int]]] = [
+                    (current_conflicts, best_symbols)
+                ]
 
                 order = np.arange(len(equations), dtype=np.int32)
                 solved = solve_equation_basis(order, masks)
                 if solved is not None:
                     conflicts = equation_conflicts(solved)
+                    ransac_candidates.append((conflicts, solved))
                     if conflicts < best_conflicts:
                         best_symbols = solved
                         best_conflicts = conflicts
@@ -714,11 +720,54 @@ def create_protocol(config: Config) -> Protocol:
                     if solved is None:
                         continue
                     conflicts = equation_conflicts(solved)
+                    ransac_candidates.append((conflicts, solved))
                     if conflicts < best_conflicts:
                         best_symbols = solved
                         best_conflicts = conflicts
                         if best_conflicts == 0:
                             break
+
+                if RANSAC_MAJORITY_TOP > 1:
+                    ransac_candidates.sort(key=lambda item: item[0])
+                    selected: List[Tuple[int, List[int]]] = []
+                    seen_candidates: Set[Tuple[int, ...]] = set()
+                    for conflicts, candidate_symbols in ransac_candidates:
+                        if conflicts > best_conflicts + RANSAC_MAJORITY_MARGIN:
+                            break
+                        key = tuple(candidate_symbols)
+                        if key in seen_candidates:
+                            continue
+                        seen_candidates.add(key)
+                        selected.append((conflicts, candidate_symbols))
+                        if len(selected) >= RANSAC_MAJORITY_TOP:
+                            break
+
+                    if len(selected) >= 3:
+                        majority_symbols = [0 for _ in symbols]
+                        best_weight = best_conflicts + RANSAC_MAJORITY_MARGIN + 1
+                        total_weight = 0
+                        weighted_bits = [
+                            [0 for _ in range(z)] for _ in range(len(symbols))
+                        ]
+                        for conflicts, candidate_symbols in selected:
+                            weight = max(1, best_weight - conflicts)
+                            total_weight += weight
+                            for idx, value in enumerate(candidate_symbols):
+                                for bit in range(z):
+                                    if int(value) & (1 << bit):
+                                        weighted_bits[idx][bit] += weight
+
+                        for idx, bit_counts in enumerate(weighted_bits):
+                            value = 0
+                            for bit, bit_weight in enumerate(bit_counts):
+                                if bit_weight * 2 >= total_weight:
+                                    value |= 1 << bit
+                            majority_symbols[idx] = value & symbol_mask
+
+                        majority_conflicts = equation_conflicts(majority_symbols)
+                        if majority_conflicts <= best_conflicts:
+                            best_symbols = majority_symbols
+                            best_conflicts = majority_conflicts
 
                 if best_conflicts < current_conflicts:
                     symbols[:] = best_symbols

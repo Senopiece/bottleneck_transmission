@@ -23,10 +23,15 @@ PHASE_REPAIR = False
 PHASE_CANDIDATE_DECODING = False
 
 SMALL_REPAIR_EXTRA_PACKETS = 8
-LARGE_REPAIR_EXTRA_PACKETS = 8
+LARGE_REPAIR_EXTRA_PACKETS = 0
 REPAIR_PASSES = 8
 SINGLETON_CONFIRMATIONS = 1
-RANSAC_REPAIR_ITERATIONS = 40
+SMALL_RANSAC_REPAIR_ITERATIONS = 40
+LARGE_RANSAC_REPAIR_ITERATIONS = 64
+SMALL_RANSAC_MAJORITY_TOP = 9
+SMALL_RANSAC_MAJORITY_MARGIN = 2
+LARGE_RANSAC_MAJORITY_TOP = 5
+LARGE_RANSAC_MAJORITY_MARGIN = 1
 
 
 def _repair_extra_packets(config: Config) -> int:
@@ -34,6 +39,30 @@ def _repair_extra_packets(config: Config) -> int:
         SMALL_REPAIR_EXTRA_PACKETS
         if int(config.message_bitsize) <= 128
         else LARGE_REPAIR_EXTRA_PACKETS
+    )
+
+
+def _ransac_majority_top(config: Config) -> int:
+    return (
+        SMALL_RANSAC_MAJORITY_TOP
+        if int(config.message_bitsize) <= 128
+        else LARGE_RANSAC_MAJORITY_TOP
+    )
+
+
+def _ransac_repair_iterations(config: Config) -> int:
+    return (
+        SMALL_RANSAC_REPAIR_ITERATIONS
+        if int(config.message_bitsize) <= 128
+        else LARGE_RANSAC_REPAIR_ITERATIONS
+    )
+
+
+def _ransac_majority_margin(config: Config) -> int:
+    return (
+        SMALL_RANSAC_MAJORITY_MARGIN
+        if int(config.message_bitsize) <= 128
+        else LARGE_RANSAC_MAJORITY_MARGIN
     )
 
 
@@ -53,6 +82,8 @@ def _apply_settings(config: Config) -> dict[str, object]:
         "REPAIR_PASSES": base_module.REPAIR_PASSES,
         "SINGLETON_CONFIRMATIONS": base_module.SINGLETON_CONFIRMATIONS,
         "RANSAC_REPAIR_ITERATIONS": base_module.RANSAC_REPAIR_ITERATIONS,
+        "RANSAC_MAJORITY_TOP": base_module.RANSAC_MAJORITY_TOP,
+        "RANSAC_MAJORITY_MARGIN": base_module.RANSAC_MAJORITY_MARGIN,
     }
 
     def tuned_robust_soliton_cdf(k: int) -> list[float]:
@@ -72,7 +103,9 @@ def _apply_settings(config: Config) -> dict[str, object]:
     base_module.REPAIR_EXTRA_PACKETS = _repair_extra_packets(config)
     base_module.REPAIR_PASSES = REPAIR_PASSES
     base_module.SINGLETON_CONFIRMATIONS = SINGLETON_CONFIRMATIONS
-    base_module.RANSAC_REPAIR_ITERATIONS = RANSAC_REPAIR_ITERATIONS
+    base_module.RANSAC_REPAIR_ITERATIONS = _ransac_repair_iterations(config)
+    base_module.RANSAC_MAJORITY_TOP = _ransac_majority_top(config)
+    base_module.RANSAC_MAJORITY_MARGIN = _ransac_majority_margin(config)
 
     return old_settings
 
