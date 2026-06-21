@@ -15,6 +15,8 @@ GROUP_SIZE = 3
 SOLITON_C = 0.02
 SOLITON_DELTA = 0.65
 SEGMENT_LENGTH_BONUS = 0.0
+SEGMENT_PROBES = 2
+RECENT_WINDOW_MARGIN = 8
 MIN_TUNED_MESSAGE_BITSIZE = 96
 
 
@@ -35,17 +37,23 @@ def _create_base_protocol(config: Config) -> Protocol:
 
     old_robust_soliton_cdf = base_module.robust_soliton_cdf
     old_segment_length_bonus = base_module.SEGMENT_LENGTH_BONUS
+    old_segment_probes = base_module.SEGMENT_PROBES
+    old_recent_window_margin = base_module.RECENT_WINDOW_MARGIN
 
     def tuned_robust_soliton_cdf(k: int) -> list[float]:
         return sparce.robust_soliton_cdf(k, c=SOLITON_C, delta=SOLITON_DELTA)
 
     base_module.robust_soliton_cdf = tuned_robust_soliton_cdf
     base_module.SEGMENT_LENGTH_BONUS = SEGMENT_LENGTH_BONUS
+    base_module.SEGMENT_PROBES = SEGMENT_PROBES
+    base_module.RECENT_WINDOW_MARGIN = RECENT_WINDOW_MARGIN
     try:
         return base_module.create_protocol(config)
     finally:
         base_module.robust_soliton_cdf = old_robust_soliton_cdf
         base_module.SEGMENT_LENGTH_BONUS = old_segment_length_bonus
+        base_module.SEGMENT_PROBES = old_segment_probes
+        base_module.RECENT_WINDOW_MARGIN = old_recent_window_margin
 
 
 def create_protocol(config: Config) -> Protocol:
