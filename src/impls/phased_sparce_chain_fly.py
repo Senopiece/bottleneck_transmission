@@ -28,6 +28,13 @@ from ._utils.sparce import (
 SEGMENT_PROBES = 4
 RECENT_WINDOW_MARGIN = 6
 SEGMENT_LENGTH_BONUS = 0.0
+PHASE_MIXING = False
+PHASE_MIX_MODE = "parity"
+PHASE_MIX_MASK = 0xFFFF
+PHASE_SYMBOL_XOR_MASK = 0
+PHASE_MATRIX_INV_COLUMNS = (0b10011, 0b11100, 0b00101, 0b01010, 0b00111)
+PHASE_REPAIR = False
+PHASE_CANDIDATE_DECODING = False
 
 # Number of previous (n-1)-bit symbols packed into x for f(x).
 PREFIX = 2
@@ -133,11 +140,91 @@ def create_protocol(config: Config) -> Protocol:
                 y ^= int(symbols_b[idx])
             return y & symbol_mask
 
+        def phase_mix_mode() -> str:
+            return PHASE_MIX_MODE if PHASE_MIXING else "none"
+
+        def phase_mix_bit(symbol: int) -> bool:
+            if phase_mix_mode() == "none":
+                return False
+            value = int(symbol) & PHASE_MIX_MASK
+            value ^= value >> 2
+            value ^= value >> 1
+            return bool(value & 1)
+
+        def gray_encode(value: int) -> int:
+            return int(value) ^ (int(value) >> 1)
+
+        def gray_decode(value: int) -> int:
+            result = int(value)
+            shift = 1
+            while shift < N:
+                result ^= result >> shift
+                shift <<= 1
+            return result
+
+        def matrix_decode(value: int) -> int:
+            result = 0
+            columns = PHASE_MATRIX_INV_COLUMNS
+            if len(columns) != N:
+                raise ValueError("PHASE_MATRIX_INV_COLUMNS length must equal packet_bitsize")
+            for bit in range(N):
+                if int(value) & (1 << bit):
+                    result ^= int(columns[bit])
+            return result & ((1 << N) - 1)
+
+        matrix_decode_table: list[int] | None = None
+        matrix_encode_table: list[int] | None = None
+        if phase_mix_mode() == "matrix":
+            matrix_decode_table = [matrix_decode(value) for value in range(1 << N)]
+            matrix_encode_table = [0 for _ in range(1 << N)]
+            for physical_value, logical_value in enumerate(matrix_decode_table):
+                matrix_encode_table[logical_value] = physical_value
+            if len(set(matrix_decode_table)) != (1 << N):
+                raise ValueError("PHASE_MATRIX_INV_COLUMNS must define an invertible matrix")
+
         def packet_id(symbol: int, phase_b: bool) -> int:
-            return int(symbol) + (symbol_q if phase_b else 0)
+            mode = phase_mix_mode()
+            symbol = int(symbol) & symbol_mask
+            phase_b = bool(phase_b)
+            if mode == "matrix":
+                assert matrix_encode_table is not None
+                return matrix_encode_table[symbol + (symbol_q if phase_b else 0)]
+            if mode == "gray":
+                return gray_encode(symbol + (symbol_q if phase_b else 0))
+
+            physical_symbol = symbol
+            if mode in ("symbol_xor", "affine") and phase_b:
+                physical_symbol ^= PHASE_SYMBOL_XOR_MASK & symbol_mask
+
+            physical_phase = phase_b
+            if mode in ("parity", "affine"):
+                physical_phase ^= phase_mix_bit(physical_symbol)
+
+            return int(physical_symbol) + (symbol_q if physical_phase else 0)
 
         def packet_from_id(value: int) -> tuple[int, bool]:
-            return value & symbol_mask, bool(value & symbol_q)
+            mode = phase_mix_mode()
+            value = int(value)
+            if mode == "matrix":
+                assert matrix_decode_table is not None
+                decoded = matrix_decode_table[value]
+                return decoded & symbol_mask, bool(decoded & symbol_q)
+            if mode == "gray":
+                decoded = gray_decode(value)
+                return decoded & symbol_mask, bool(decoded & symbol_q)
+
+            physical_symbol = value & symbol_mask
+            physical_phase = bool(value & symbol_q)
+
+            phase_b = physical_phase
+            if mode in ("parity", "affine"):
+                phase_b ^= phase_mix_bit(physical_symbol)
+
+            symbol = physical_symbol
+            if mode in ("symbol_xor", "affine") and phase_b:
+                symbol ^= PHASE_SYMBOL_XOR_MASK & symbol_mask
+
+            return symbol, phase_b
 
         def phased_output(symbol: int, is_phase_b: bool):
             return uint16_to_bool_array(np.uint16(packet_id(symbol, is_phase_b)), N)
@@ -372,6 +459,113 @@ def create_protocol(config: Config) -> Protocol:
 
         total_k = k1 + k2
 
+        def observed_phase_mix_mode() -> str:
+            return PHASE_MIX_MODE if PHASE_MIXING else "none"
+
+        def observed_phase_mix_bit(symbol: int) -> bool:
+            if observed_phase_mix_mode() == "none":
+                return False
+            value = int(symbol) & PHASE_MIX_MASK
+            value ^= value >> 2
+            value ^= value >> 1
+            return bool(value & 1)
+
+        def observed_gray_decode(value: int) -> int:
+            result = int(value)
+            shift = 1
+            while shift < N:
+                result ^= result >> shift
+                shift <<= 1
+            return result
+
+        def observed_matrix_decode(value: int) -> int:
+            result = 0
+            columns = PHASE_MATRIX_INV_COLUMNS
+            if len(columns) != N:
+                raise ValueError("PHASE_MATRIX_INV_COLUMNS length must equal packet_bitsize")
+            for bit in range(N):
+                if int(value) & (1 << bit):
+                    result ^= int(columns[bit])
+            return result & ((1 << N) - 1)
+
+        observed_matrix_decode_table: list[int] | None = None
+        if observed_phase_mix_mode() == "matrix":
+            observed_matrix_decode_table = [
+                observed_matrix_decode(value) for value in range(1 << N)
+            ]
+            if len(set(observed_matrix_decode_table)) != (1 << N):
+                raise ValueError("PHASE_MATRIX_INV_COLUMNS must define an invertible matrix")
+
+        def observed_packet_from_id(value: int) -> tuple[int, bool]:
+            mode = observed_phase_mix_mode()
+            value = int(value)
+            if mode == "matrix":
+                assert observed_matrix_decode_table is not None
+                decoded = observed_matrix_decode_table[value]
+                return decoded & symbol_mask, bool(decoded & symbol_q)
+            if mode == "gray":
+                decoded = observed_gray_decode(value)
+                return decoded & symbol_mask, bool(decoded & symbol_q)
+
+            physical_symbol = value & symbol_mask
+            physical_phase = bool(value & symbol_q)
+
+            phase_b = physical_phase
+            if mode in ("parity", "affine"):
+                phase_b ^= observed_phase_mix_bit(physical_symbol)
+
+            symbol = physical_symbol
+            if mode in ("symbol_xor", "affine") and phase_b:
+                symbol ^= PHASE_SYMBOL_XOR_MASK & symbol_mask
+
+            return symbol, phase_b
+
+        def observed_packet_candidates(value: int) -> list[tuple[int, bool, int]]:
+            symbol, phase_b = observed_packet_from_id(value)
+            if not PHASE_CANDIDATE_DECODING:
+                return [(symbol, phase_b, 0)]
+
+            candidates: dict[tuple[int, bool], int] = {(symbol, phase_b): 0}
+            for bit in range(N):
+                candidate_value = int(value) ^ (1 << bit)
+                candidate = observed_packet_from_id(candidate_value)
+                if candidate not in candidates:
+                    candidates[candidate] = 1
+
+            return [
+                (candidate_symbol, candidate_phase, penalty)
+                for (candidate_symbol, candidate_phase), penalty in candidates.items()
+            ]
+
+        def choose_observed_packet(value: int) -> tuple[int, bool]:
+            candidates = observed_packet_candidates(value)
+            raw_symbol, raw_phase, _raw_penalty = candidates[0]
+            if not PHASE_CANDIDATE_DECODING or not run_phases:
+                return raw_symbol, raw_phase
+
+            last_symbol = run_symbols[-1]
+            last_phase = run_phases[-1]
+            raw_is_alternating = raw_phase != last_phase
+            raw_is_duplicate_reset = raw_symbol == last_symbol
+            if raw_is_alternating or raw_is_duplicate_reset:
+                return raw_symbol, raw_phase
+
+            best: tuple[tuple[int, int], int, bool] | None = None
+            for candidate_symbol, candidate_phase, penalty in candidates[1:]:
+                if candidate_phase != last_phase:
+                    score = (penalty, 0)
+                elif candidate_symbol == last_symbol:
+                    score = (penalty, 1)
+                else:
+                    continue
+
+                if best is None or score < best[0]:
+                    best = (score, candidate_symbol, candidate_phase)
+
+            if best is None:
+                return raw_symbol, raw_phase
+            return best[1], best[2]
+
         def progress() -> float:
             if total_k == 0:
                 return 1.0
@@ -431,19 +625,25 @@ def create_protocol(config: Config) -> Protocol:
                 run_phases.clear()
                 continue
 
-            curr_phase = bool(packet[0])
-            curr_symbol = int(bool_array_to_uint16(packet) & symbol_mask)
+            curr_symbol, curr_phase = choose_observed_packet(
+                int(bool_array_to_uint16(packet))
+            )
 
             if run_phases and curr_phase == run_phases[-1]:
                 is_duplicate_reset = curr_symbol == run_symbols[-1]
-                if pending_edge is not None:
-                    if is_duplicate_reset:
-                        pending_edge = None
-                    else:
-                        commit_pending_edge()
-                run_symbols[:] = [curr_symbol]
-                run_phases[:] = [curr_phase]
-                continue
+                if (not PHASE_REPAIR) or is_duplicate_reset:
+                    if pending_edge is not None:
+                        if is_duplicate_reset:
+                            pending_edge = None
+                        else:
+                            commit_pending_edge()
+                    run_symbols[:] = [curr_symbol]
+                    run_phases[:] = [curr_phase]
+                    continue
+
+                # A same-phase, different-symbol packet is more often a flipped
+                # phase observation than a real delimiter inside guarded streams.
+                curr_phase = not curr_phase
 
             run_symbols.append(curr_symbol)
             run_phases.append(curr_phase)
